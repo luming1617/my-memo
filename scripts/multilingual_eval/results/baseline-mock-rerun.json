@@ -1,0 +1,703 @@
+{
+  "meta": {
+    "label": "baseline-mock-rerun",
+    "timestamp": "2026-11-17T02:02:13.460986+00:00",
+    "git_commit": "efdcb485642f9ac5bb03f29c94c1f01ae7057d81",
+    "mode": "mock",
+    "capabilities": {
+      "spacy_model": true,
+      "fastembed_bm25_cached": true
+    },
+    "dataset_version": 1
+  },
+  "cases": [
+    {
+      "id": "zh_ext_01",
+      "class": "zh_extraction",
+      "stored_memories": [
+        "张伟最喜欢喝手冲咖啡，尤其是耶加雪菲产区的咖啡豆",
+        "张伟周末经常去北京香山徒步"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "fact_coverage": 1.0,
+      "facts_covered": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "lang_match_rate": 1.0,
+      "cjk_ratios": [
+        0.9583333333333334,
+        1.0
+      ],
+      "queries": [
+        {
+          "query": "用户喜欢什么咖啡",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "1017935f-52ce-4e19-b0e7-c5fcc7a760a0",
+              "memory": "张伟最喜欢喝手冲咖啡，尤其是耶加雪菲产区的咖啡豆",
+              "score": 0.3903600650992089,
+              "semantic_score": 0.3903600650992089,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ]
+    },
+    {
+      "id": "zh_ext_02",
+      "class": "zh_extraction",
+      "stored_memories": [
+        "用户上个月在苹果官网购买了一台 iPhone 16 Pro 256G，花费 8999 元"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "fact_coverage": 1.0,
+      "facts_covered": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "lang_match_rate": 1.0,
+      "cjk_ratios": [
+        0.4090909090909091
+      ],
+      "queries": []
+    },
+    {
+      "id": "en_ext_01",
+      "class": "en_extraction",
+      "stored_memories": [
+        "Sarah loves pour-over coffee",
+        "Sarah hikes in the Blue Ridge Mountains every weekend"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "fact_coverage": 1.0,
+      "facts_covered": [
+        true,
+        true,
+        true
+      ],
+      "lang_match_rate": 1.0,
+      "cjk_ratios": [
+        0.0,
+        0.0
+      ],
+      "queries": [
+        {
+          "query": "what coffee does the user like",
+          "num_results": 2,
+          "results": [
+            {
+              "id": "5ebd1c2d-fc5a-48f2-9f0e-34311659f9de",
+              "memory": "Sarah loves pour-over coffee",
+              "score": 0.14409354070656916,
+              "semantic_score": 0.18257419581569548,
+              "bm25_score": 0.10561288559744286,
+              "entity_boost": 0.0,
+              "max_possible_score": 2.0
+            },
+            {
+              "id": "13be5299-c604-47b7-ba2d-a33d84e3d2cf",
+              "memory": "Sarah hikes in the Blue Ridge Mountains every weekend",
+              "score": 0.06804138377176837,
+              "semantic_score": 0.13608276754353674,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 2.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ]
+    },
+    {
+      "id": "en_ext_02",
+      "class": "en_extraction",
+      "stored_memories": [
+        "The user bought an iPhone 16 Pro 256G last month for $999 from the Apple website"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "fact_coverage": 1.0,
+      "facts_covered": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "lang_match_rate": 1.0,
+      "cjk_ratios": [
+        0.0
+      ],
+      "queries": []
+    },
+    {
+      "id": "mixed_ext_01",
+      "class": "mixed_extraction",
+      "stored_memories": [
+        "用户最近在用 MacBook Pro 写 Rust 代码，认为 battery life 很好"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "fact_coverage": 1.0,
+      "facts_covered": [
+        true,
+        true,
+        true
+      ],
+      "queries": []
+    },
+    {
+      "id": "cross_01",
+      "class": "cross_lingual_recall",
+      "stored_memories": [
+        "用户最喜欢喝手冲咖啡，尤其是耶加雪菲产区的咖啡豆"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "What kind of coffee does the user like?",
+          "num_results": 0,
+          "results": [],
+          "hit": false,
+          "first_hit_rank": null
+        }
+      ]
+    },
+    {
+      "id": "cross_02",
+      "class": "cross_lingual_recall",
+      "stored_memories": [
+        "The user loves pour-over coffee, especially Yirgacheffe beans"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "用户喜欢什么咖啡？",
+          "num_results": 0,
+          "results": [],
+          "hit": false,
+          "first_hit_rank": null
+        }
+      ]
+    },
+    {
+      "id": "lexical_01",
+      "class": "lexical_precision_zh",
+      "stored_memories": [
+        "用户的手机型号是 iPhone 16 Pro 256G，购于苹果官网"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "iPhone 16 Pro 256G",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "1fa9409a-2c07-4bf6-a112-3124a2c3cca4",
+              "memory": "用户的手机型号是 iPhone 16 Pro 256G，购于苹果官网",
+              "score": 0.27016690155938894,
+              "semantic_score": 0.4803844913840294,
+              "bm25_score": 0.05994931173474853,
+              "entity_boost": 0.0,
+              "max_possible_score": 2.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ]
+    },
+    {
+      "id": "lexical_02",
+      "class": "lexical_precision_zh",
+      "stored_memories": [
+        "家里路由器型号是 XJ-900，放在书房"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "XJ-900",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "7a3221c4-eea4-4cc4-b293-d6a34052440e",
+              "memory": "家里路由器型号是 XJ-900，放在书房",
+              "score": 0.2828427166893039,
+              "semantic_score": 0.2828427166893039,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ]
+    },
+    {
+      "id": "entity_01",
+      "class": "entity_boost_zh",
+      "stored_memories": [
+        "用户在苹果公司工作，负责 iPhone 产品线"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "苹果公司",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "62e5496c-0895-4925-ac2d-13b5be810f95",
+              "memory": "用户在苹果公司工作，负责 iPhone 产品线",
+              "score": 0.5345225197337624,
+              "semantic_score": 0.5345225197337624,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1,
+          "entity_boost_hit": false
+        }
+      ]
+    },
+    {
+      "id": "entity_02",
+      "class": "entity_alias_guard",
+      "stored_memories": [
+        "The user grows Pineapple plants in the garden"
+      ],
+      "stored_metadata": [
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "Apple stock price",
+          "num_results": 0,
+          "results": [],
+          "boost_guard_violations": []
+        }
+      ]
+    },
+    {
+      "id": "nd_01",
+      "class": "near_duplicate_translation",
+      "stored_memories": [
+        "张伟喜欢喝手冲咖啡",
+        "Zhang Wei likes pour-over coffee"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "咖啡",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "1deaf36b-37cd-47e8-9f10-e37c879d5ea2",
+              "memory": "张伟喜欢喝手冲咖啡",
+              "score": 0.4200840439018019,
+              "semantic_score": 0.4200840439018019,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ],
+      "pair_similarity": 0.0,
+      "pair_co_returned": 1,
+      "fold_expected": true
+    },
+    {
+      "id": "nd_02",
+      "class": "near_duplicate_negation",
+      "stored_memories": [
+        "张伟喜欢喝咖啡",
+        "张伟不再喝咖啡了"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "咖啡",
+          "num_results": 2,
+          "results": [
+            {
+              "id": "0f5cd0e8-ff62-461a-ac7b-1c37862c8a3d",
+              "memory": "张伟喜欢喝咖啡",
+              "score": 0.48038446103776794,
+              "semantic_score": 0.48038446103776794,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            },
+            {
+              "id": "6f30119e-2ccf-4e38-9ada-4fd173325d98",
+              "memory": "张伟不再喝咖啡了",
+              "score": 0.44721359093183916,
+              "semantic_score": 0.44721359093183916,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ],
+      "pair_similarity": 0.5728918992315464,
+      "pair_co_returned": 2,
+      "fold_expected": false
+    },
+    {
+      "id": "nd_03",
+      "class": "near_duplicate_number",
+      "stored_memories": [
+        "用户的手机是 iPhone 16 Pro 256G",
+        "用户的手机是 iPhone 16 Pro 512G"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "iPhone 16 Pro",
+          "num_results": 2,
+          "results": [
+            {
+              "id": "06260a55-1760-482d-905f-137e5678da10",
+              "memory": "用户的手机是 iPhone 16 Pro 512G",
+              "score": 0.2640757148710264,
+              "semantic_score": 0.44721364255097573,
+              "bm25_score": 0.08093778719107704,
+              "entity_boost": 0.0,
+              "max_possible_score": 2.0
+            },
+            {
+              "id": "86907a54-e11e-42cf-a71c-fee8755646bc",
+              "memory": "用户的手机是 iPhone 16 Pro 256G",
+              "score": 0.2640757148710264,
+              "semantic_score": 0.44721364255097573,
+              "bm25_score": 0.08093778719107704,
+              "entity_boost": 0.0,
+              "max_possible_score": 2.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1
+        }
+      ],
+      "pair_similarity": 0.9333333333333333,
+      "pair_co_returned": 2,
+      "fold_expected": false
+    },
+    {
+      "id": "tenant_01",
+      "class": "multi_tenant",
+      "stored_memories": [
+        "用户喜欢喝手冲咖啡",
+        "用户喜欢喝手冲咖啡"
+      ],
+      "stored_metadata": [
+        {},
+        {}
+      ],
+      "llm_mock_misses": 0,
+      "queries": [
+        {
+          "query": "咖啡",
+          "num_results": 1,
+          "results": [
+            {
+              "id": "62c44ee2-30d9-4eb1-a8d8-41d03f2ae6b6",
+              "memory": "用户喜欢喝手冲咖啡",
+              "score": 0.4200840439018019,
+              "semantic_score": 0.4200840439018019,
+              "bm25_score": 0.0,
+              "entity_boost": 0.0,
+              "max_possible_score": 1.0
+            }
+          ],
+          "hit": true,
+          "first_hit_rank": 1,
+          "isolation_ok": true
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "zh_extraction": {
+      "cases": 2,
+      "fact_coverage": 1.0,
+      "lang_match_rate": 1.0,
+      "hit_rate": 1.0,
+      "mrr": 1.0
+    },
+    "en_extraction": {
+      "cases": 2,
+      "fact_coverage": 1.0,
+      "lang_match_rate": 1.0,
+      "hit_rate": 1.0,
+      "mrr": 1.0
+    },
+    "mixed_extraction": {
+      "cases": 1,
+      "fact_coverage": 1.0
+    },
+    "cross_lingual_recall": {
+      "cases": 2,
+      "hit_rate": 0.0
+    },
+    "lexical_precision_zh": {
+      "cases": 2,
+      "hit_rate": 1.0,
+      "mrr": 1.0
+    },
+    "entity_boost_zh": {
+      "cases": 1,
+      "hit_rate": 1.0,
+      "mrr": 1.0,
+      "entity_boost_hit_rate": 0.0
+    },
+    "entity_alias_guard": {
+      "cases": 1,
+      "boost_guard_violations": 0
+    },
+    "near_duplicate_translation": {
+      "cases": 1,
+      "pair_similarity": 0.0,
+      "hit_rate": 1.0,
+      "mrr": 1.0,
+      "pair_co_returned": 1.0
+    },
+    "near_duplicate_negation": {
+      "cases": 1,
+      "pair_similarity": 0.5729,
+      "hit_rate": 1.0,
+      "mrr": 1.0,
+      "pair_co_returned": 2.0
+    },
+    "near_duplicate_number": {
+      "cases": 1,
+      "pair_similarity": 0.9333,
+      "hit_rate": 1.0,
+      "mrr": 1.0,
+      "pair_co_returned": 2.0
+    },
+    "multi_tenant": {
+      "cases": 1,
+      "hit_rate": 1.0,
+      "mrr": 1.0,
+      "isolation_ok_rate": 1.0
+    }
+  },
+  "explain": {
+    "zh_extraction": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.3903600650992089,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 1,
+      "max_possible_sum": 1.0,
+      "mean_semantic": 0.3904,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.0
+    },
+    "en_extraction": {
+      "queries": 1,
+      "bm25_active": 1,
+      "entity_active": 0,
+      "semantic_sum": 0.3186569633592322,
+      "bm25_sum": 0.10561288559744286,
+      "entity_sum": 0.0,
+      "scored_results": 2,
+      "max_possible_sum": 4.0,
+      "mean_semantic": 0.1593,
+      "mean_bm25": 0.0528,
+      "mean_entity": 0.0,
+      "mean_max_possible": 2.0
+    },
+    "mixed_extraction": {
+      "queries": 0,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.0,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 0,
+      "max_possible_sum": 0.0,
+      "mean_semantic": 0.0,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 0.0
+    },
+    "cross_lingual_recall": {
+      "queries": 2,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.0,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 0,
+      "max_possible_sum": 0.0,
+      "mean_semantic": 0.0,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 0.0
+    },
+    "lexical_precision_zh": {
+      "queries": 2,
+      "bm25_active": 1,
+      "entity_active": 0,
+      "semantic_sum": 0.7632272080733333,
+      "bm25_sum": 0.05994931173474853,
+      "entity_sum": 0.0,
+      "scored_results": 2,
+      "max_possible_sum": 3.0,
+      "mean_semantic": 0.3816,
+      "mean_bm25": 0.03,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.5
+    },
+    "entity_boost_zh": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.5345225197337624,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 1,
+      "max_possible_sum": 1.0,
+      "mean_semantic": 0.5345,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.0
+    },
+    "entity_alias_guard": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.0,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 0,
+      "max_possible_sum": 0.0,
+      "mean_semantic": 0.0,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 0.0
+    },
+    "near_duplicate_translation": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.4200840439018019,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 1,
+      "max_possible_sum": 1.0,
+      "mean_semantic": 0.4201,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.0
+    },
+    "near_duplicate_negation": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.9275980519696071,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 2,
+      "max_possible_sum": 2.0,
+      "mean_semantic": 0.4638,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.0
+    },
+    "near_duplicate_number": {
+      "queries": 1,
+      "bm25_active": 1,
+      "entity_active": 0,
+      "semantic_sum": 0.8944272851019515,
+      "bm25_sum": 0.16187557438215408,
+      "entity_sum": 0.0,
+      "scored_results": 2,
+      "max_possible_sum": 4.0,
+      "mean_semantic": 0.4472,
+      "mean_bm25": 0.0809,
+      "mean_entity": 0.0,
+      "mean_max_possible": 2.0
+    },
+    "multi_tenant": {
+      "queries": 1,
+      "bm25_active": 0,
+      "entity_active": 0,
+      "semantic_sum": 0.4200840439018019,
+      "bm25_sum": 0.0,
+      "entity_sum": 0.0,
+      "scored_results": 1,
+      "max_possible_sum": 1.0,
+      "mean_semantic": 0.4201,
+      "mean_bm25": 0.0,
+      "mean_entity": 0.0,
+      "mean_max_possible": 1.0
+    }
+  }
+}

@@ -143,6 +143,22 @@ class OutputData(BaseModel):
     payload: Optional[dict]
 
 
+SPARSEVEC_MAX_NNZ = 1000
+
+
+def _sparsevec_literal(sparse: dict) -> str:
+    """Render a {"indices", "values"} dict as a pgvector sparsevec literal.
+
+    pgvector indices are 1-based and sparsevec caps at 1000 non-zero
+    elements: keep the top-1000 weights (ties broken by smaller index).
+    """
+    pairs = sorted(zip(sparse["indices"], sparse["values"]), key=lambda p: (-p[1], p[0]))[:SPARSEVEC_MAX_NNZ]
+    pairs = sorted((int(i) + 1, float(v)) for i, v in pairs)
+    dim = pairs[-1][0] if pairs else 1
+    body = ",".join(f"{i}:{v}" for i, v in pairs)
+    return "{" + body + "}/" + str(dim)
+
+
 class PGVector(VectorStoreBase):
     def __init__(
         self,
@@ -160,6 +176,7 @@ class PGVector(VectorStoreBase):
         sslmode=None,
         connection_string=None,
         connection_pool=None,
+        sparse_encoder="bm25",
     ):
         """
         Initialize the PGVector database.
@@ -186,6 +203,8 @@ class PGVector(VectorStoreBase):
         self.embedding_model_dims = embedding_model_dims
         self.connection_pool = None
         self._collection_ensured = False
+        self._sparse_encoder = sparse_encoder
+        self.supports_sparse_vectors = sparse_encoder == "learned"
 
         # Connection setup with priority: connection_pool > connection_string > individual parameters
         if connection_pool is not None:
@@ -212,6 +231,10 @@ class PGVector(VectorStoreBase):
             else:
                 # psycopg2 ThreadedConnectionPool
                 self.connection_pool = ConnectionPool(minconn=minconn, maxconn=maxconn, dsn=connection_string)
+
+    @property
+    def sparse_encoder(self) -> str:
+        return self._sparse_encoder
 
     def _ensure_collection(self):
         if self._collection_ensured:
@@ -266,15 +289,27 @@ class PGVector(VectorStoreBase):
         """
         with self._get_cursor(commit=True) as cur:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            cur.execute(
-                sql.SQL("""
-                CREATE TABLE IF NOT EXISTS {} (
-                    id UUID PRIMARY KEY,
-                    vector vector({}),
-                    payload JSONB
-                );
-                """).format(self._col(), sql.Literal(self.embedding_model_dims))
-            )
+            if self._sparse_encoder == "learned":
+                cur.execute(
+                    sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {} (
+                        id UUID PRIMARY KEY,
+                        vector vector({}),
+                        payload JSONB,
+                        sparse_vector sparsevec
+                    );
+                    """).format(self._col(), sql.Literal(self.embedding_model_dims))
+                )
+            else:
+                cur.execute(
+                    sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {} (
+                        id UUID PRIMARY KEY,
+                        vector vector({}),
+                        payload JSONB
+                    );
+                    """).format(self._col(), sql.Literal(self.embedding_model_dims))
+                )
             if self.use_diskann and self.embedding_model_dims < 2000:
                 cur.execute("SELECT * FROM pg_extension WHERE extname = 'vectorscale'")
                 if cur.fetchone():
@@ -298,35 +333,67 @@ class PGVector(VectorStoreBase):
                         self._col(),
                     )
                 )
-            cur.execute(
-                sql.SQL("""
-                CREATE INDEX IF NOT EXISTS {} ON {}
-                USING gin(to_tsvector('simple', payload->>'text_lemmatized'));
-                """).format(
-                    sql.Identifier(f"{self.collection_name}_text_lemmatized_idx"),
-                    self._col(),
+            if self._sparse_encoder == "learned":
+                # Inner-product HNSW over the sparsevec column (pgvector >= 0.7.0)
+                cur.execute(
+                    sql.SQL("""
+                    CREATE INDEX IF NOT EXISTS {} ON {}
+                    USING hnsw (sparse_vector sparsevec_ip_ops);
+                    """).format(
+                        sql.Identifier(f"{self.collection_name}_sparse_hnsw_idx"),
+                        self._col(),
+                    )
                 )
-            )
+            elif self._sparse_encoder != "none":
+                cur.execute(
+                    sql.SQL("""
+                    CREATE INDEX IF NOT EXISTS {} ON {}
+                    USING gin(to_tsvector('simple', payload->>'text_lemmatized'));
+                    """).format(
+                        sql.Identifier(f"{self.collection_name}_text_lemmatized_idx"),
+                        self._col(),
+                    )
+                )
 
-    def insert(self, vectors: list[list[float]], payloads=None, ids=None) -> None:
+    def insert(self, vectors: list[list[float]], payloads=None, ids=None, sparse_vectors=None) -> None:
         self._ensure_collection()
         logger.info(f"Inserting {len(vectors)} vectors into collection {self.collection_name}")
         json_payloads = [json.dumps(payload) for payload in payloads]
 
-        data = [(id, vector, payload) for id, vector, payload in zip(ids, vectors, json_payloads)]
+        if self._sparse_encoder == "learned":
+            sparse_literals = [
+                _sparsevec_literal(sv) if sv is not None else None
+                for sv in (sparse_vectors if sparse_vectors is not None else [None] * len(vectors))
+            ]
+            data = [
+                (id, vector, payload, sparse)
+                for id, vector, payload, sparse in zip(ids, vectors, json_payloads, sparse_literals)
+            ]
+            statement = sql.SQL(
+                "INSERT INTO {} (id, vector, payload, sparse_vector) VALUES (%s, %s, %s, %s::sparsevec)"
+            ).format(self._col())
+        else:
+            data = [(id, vector, payload) for id, vector, payload in zip(ids, vectors, json_payloads)]
+            statement = sql.SQL("INSERT INTO {} (id, vector, payload) VALUES (%s, %s, %s)").format(self._col())
+
         if PSYCOPG_VERSION == 3:
             with self._get_cursor(commit=True) as cur:
-                cur.executemany(
-                    sql.SQL("INSERT INTO {} (id, vector, payload) VALUES (%s, %s, %s)").format(self._col()),
-                    data,
-                )
+                cur.executemany(statement, data)
         else:
             with self._get_cursor(commit=True) as cur:
-                execute_values(
-                    cur,
-                    sql.SQL("INSERT INTO {} (id, vector, payload) VALUES %s").format(self._col()),
-                    data,
-                )
+                if self._sparse_encoder == "learned":
+                    execute_values(
+                        cur,
+                        sql.SQL("INSERT INTO {} (id, vector, payload, sparse_vector) VALUES %s").format(self._col()),
+                        data,
+                        template="(%s, %s, %s, %s::sparsevec)",
+                    )
+                else:
+                    execute_values(
+                        cur,
+                        sql.SQL("INSERT INTO {} (id, vector, payload) VALUES %s").format(self._col()),
+                        data,
+                    )
 
     def search(
         self,
@@ -366,21 +433,49 @@ class PGVector(VectorStoreBase):
             results = cur.fetchall()
         return [OutputData(id=str(r[0]), score=max(0.0, 1.0 - float(r[1])), payload=r[2]) for r in results]
 
-    def keyword_search(self, query, top_k=5, filters=None):
+    def keyword_search(self, query, top_k=5, filters=None, sparse_vector=None):
         """
-        Search using PostgreSQL full-text search on lemmatized text.
+        Keyword search: learned sparsevec inner product, or legacy PostgreSQL
+        full-text search on lemmatized text.
 
         Args:
             query (str): The search query text.
             top_k (int, optional): Number of results to return. Defaults to 5.
             filters (dict, optional): Filters to apply to the search. Defaults to None.
+            sparse_vector (dict, optional): Precomputed learned query sparse
+                vector ({"indices", "values"}) used when sparse_encoder="learned".
 
         Returns:
             List[OutputData]: Search results ranked by text relevance.
         """
         self._ensure_collection()
+        if self._sparse_encoder == "none":
+            return None
         filter_conditions, filter_params = _build_filter_conditions(filters)
         filter_clause = sql.SQL("AND " + " AND ".join(filter_conditions)) if filter_conditions else sql.SQL("")
+
+        if self._sparse_encoder == "learned":
+            if sparse_vector is None:
+                return None
+            try:
+                with self._get_cursor() as cur:
+                    # <#> returns negative inner product; flip to higher=better.
+                    cur.execute(
+                        sql.SQL("""
+                        SELECT id, -(sparse_vector <#> %s::sparsevec) AS score, payload
+                        FROM {}
+                        WHERE sparse_vector IS NOT NULL
+                        {}
+                        ORDER BY score DESC
+                        LIMIT %s
+                        """).format(self._col(), filter_clause),
+                        (_sparsevec_literal(sparse_vector), *filter_params, top_k),
+                    )
+                    results = cur.fetchall()
+                return [OutputData(id=str(r[0]), score=float(r[1]), payload=r[2]) for r in results]
+            except Exception as e:
+                logger.debug(f"Sparse keyword search failed: {e}")
+                return None
 
         try:
             with self._get_cursor() as cur:
@@ -418,6 +513,7 @@ class PGVector(VectorStoreBase):
         vector_id: str,
         vector: Optional[list[float]] = None,
         payload: Optional[dict] = None,
+        sparse_vector: Optional[dict] = None,
     ) -> Optional[bool]:
         """
         Update a vector and its payload.
@@ -426,15 +522,22 @@ class PGVector(VectorStoreBase):
             vector_id (str): ID of the vector to update.
             vector (List[float], optional): Updated vector.
             payload (Dict, optional): Updated payload.
+            sparse_vector (Dict, optional): Learned sparse vector refreshed
+                when sparse_encoder="learned".
         """
         self._ensure_collection()
-        if vector is None and payload is None:
+        if vector is None and payload is None and sparse_vector is None:
             return None
         with self._get_cursor(commit=True) as cur:
             if vector is not None:
                cur.execute(
                     sql.SQL("UPDATE {} SET vector = %s WHERE id = %s").format(self._col()),
                     (vector, vector_id),
+                )
+            if sparse_vector is not None and self._sparse_encoder == "learned":
+                cur.execute(
+                    sql.SQL("UPDATE {} SET sparse_vector = %s::sparsevec WHERE id = %s").format(self._col()),
+                    (_sparsevec_literal(sparse_vector), vector_id),
                 )
             if payload is not None:
                 # Handle JSON serialization based on psycopg version

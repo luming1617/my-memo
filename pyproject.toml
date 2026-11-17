@@ -80,6 +80,9 @@ test = [
     "pytest-mock>=3.14.0",
     "pytest-asyncio>=0.23.7",
 ]
+dual = [
+    "FlagEmbedding>=1.2.10",
+]
 dev = [
     "ruff==0.16.0",
     "isort>=5.13.2",

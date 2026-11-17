@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,6 +19,10 @@ class PGVectorConfig(BaseModel):
     sslmode: Optional[str] = Field(None, description="SSL mode for PostgreSQL connection (e.g., 'require', 'prefer', 'disable')")
     connection_string: Optional[str] = Field(None, description="PostgreSQL connection string (overrides individual connection parameters)")
     connection_pool: Optional[Any] = Field(None, description="psycopg connection pool object (overrides connection string and individual parameters)")
+    sparse_encoder: Literal["bm25", "learned", "none"] = Field(
+        "bm25",
+        description="Keyword path encoding: 'bm25' (legacy full-text search), 'learned' (sparsevec column, pgvector >= 0.7.0) or 'none' (no keyword path)",
+    )
 
     @model_validator(mode="before")
     def check_auth_and_connection(cls, values):

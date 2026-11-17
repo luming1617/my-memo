@@ -999,7 +999,9 @@ async def test_async_delete_all_continues_on_partial_failure(mock_sqlite, mock_l
 
     assert result == {"message": "Memories deleted successfully!"}
     assert mock_vector_store.delete.call_count == 2
-    assert mock_vector_store.list.call_args_list[0].kwargs == {
+    # Startup version-stamp sampling also calls list(); find the delete_all batch call.
+    batch_calls = [c for c in mock_vector_store.list.call_args_list if c.kwargs.get("top_k") == 1000]
+    assert batch_calls[0].kwargs == {
         "filters": {"user_id": "test-user"},
         "top_k": 1000,
     }
@@ -1479,7 +1481,6 @@ class TestAsyncDeleteAllEntityRace:
         mem_b = MagicMock()
         mem_b.id = "mem-b"
         mem_b.payload = {"data": "Alice works at Acme", "user_id": "alice"}
-        mock_vector_store.list.side_effect = [([mem_a, mem_b],), ([],)]
         mock_vector_store.get.side_effect = lambda vector_id: {"mem-a": mem_a, "mem-b": mem_b}[vector_id]
         mock_vector_factory.return_value = mock_vector_store
 
@@ -1496,6 +1497,8 @@ class TestAsyncDeleteAllEntityRace:
         from mem0.memory.main import AsyncMemory
         config = MemoryConfig()
         memory = AsyncMemory(config)
+        # Set after construction: startup version-stamp sampling consumes one list() call.
+        mock_vector_store.list.side_effect = [([mem_a, mem_b],), ([],)]
         memory._entity_store = mock_entity_store
 
         await memory.delete_all(user_id="alice")

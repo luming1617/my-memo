@@ -58,6 +58,7 @@ from mem0.memory.utils import (
     process_telemetry_filters,
     remove_code_blocks,
 )
+from mem0.utils.entity_dictionary import EntityDictionary
 from mem0.utils.entity_extraction import extract_entities, extract_entities_batch
 from mem0.utils.factory import (
     EmbedderFactory,
@@ -66,10 +67,12 @@ from mem0.utils.factory import (
     VectorStoreFactory,
 )
 from mem0.utils.lemmatization import lemmatize_for_bm25
+from mem0.utils.model_profiles import PAYLOAD_SCHEMA_VERSION, resolve_profile
 from mem0.utils.scoring import (
     ENTITY_BOOST_WEIGHT,
     get_bm25_params,
     normalize_bm25,
+    normalize_sparse_coverage,
     score_and_rank,
 )
 from mem0.vector_stores.base import VectorStoreBase
@@ -88,6 +91,191 @@ def _vector_store_list_rows(listed):
     if isinstance(listed, (list, tuple)):
         return listed
     return []
+
+
+def _embedding_model_id(config, embedding_model) -> str:
+    model = getattr(getattr(embedding_model, "config", None), "model", None) or (config.embedder.config or {}).get(
+        "model"
+    ) or "default"
+    revision = getattr(embedding_model, "revision", None) or (config.embedder.config or {}).get("revision")
+    return f"{config.embedder.provider}:{model}" + (f"@{revision}" if revision else "")
+
+
+def _resolve_model_profile(config, embedding_model):
+    model = getattr(getattr(embedding_model, "config", None), "model", None) or (config.embedder.config or {}).get(
+        "model"
+    )
+    return resolve_profile(model, config.profiles)
+
+
+def _build_version_stamps(config, embedding_model) -> Dict[str, str]:
+    vs_config = config.vector_store.config
+    if isinstance(vs_config, dict):
+        sparse_encoder_id = vs_config.get("sparse_encoder") or "bm25"
+    else:
+        sparse_encoder_id = getattr(vs_config, "sparse_encoder", None) or "bm25"
+    return {
+        "embedder_id": _embedding_model_id(config, embedding_model),
+        "sparse_encoder_id": sparse_encoder_id,
+        "schema_version": PAYLOAD_SCHEMA_VERSION,
+    }
+
+
+def _check_version_stamps(vector_store, stamps: Dict[str, str]) -> Optional[str]:
+    """Sample existing payloads; return a write-block reason on stamp mismatch.
+
+    Legacy payloads without stamps are allowed (migration is out of scope).
+    Sampling failures never block writes — the guard only acts on evidence.
+    """
+    try:
+        rows = _vector_store_list_rows(vector_store.list(filters=None, top_k=5))
+    except Exception as e:
+        logger.warning(f"Version-stamp sampling failed, skipping startup validation: {e}")
+        return None
+    for row in rows:
+        payload = getattr(row, "payload", None) or {}
+        for key, value in stamps.items():
+            existing = payload.get(key)
+            if existing is not None and existing != value:
+                return (
+                    f"Collection was written with {key}={existing!r} but the current config uses {value!r}. "
+                    "Writes are blocked to avoid mixing incompatible vector spaces. "
+                    "Use a new collection for the new configuration (existing data is not migrated)."
+                )
+    return None
+
+
+_LLM_ENTITY_TYPE_MAP = {
+    "person": "PROPER",
+    "org": "PROPER",
+    "location": "PROPER",
+    "brand": "PROPER",
+    "work": "PROPER",
+    "topic": "TOPIC",
+    "concept": "TOPIC",
+    "identifier": "IDENTIFIER",
+}
+
+
+def _validate_llm_entities(raw) -> Optional[list]:
+    """Normalize LLM-output entities to [{surface, aliases, type}].
+
+    Returns None when the field is missing or malformed so the caller can
+    fall back to spaCy for that memory. Unknown types coerce to PROPER;
+    surfaces are deduplicated by normalized text.
+    """
+    if not isinstance(raw, list):
+        return None
+    out = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        surface = item.get("surface")
+        if not isinstance(surface, str) or not surface.strip():
+            return None
+        aliases = item.get("aliases") or []
+        if not isinstance(aliases, list):
+            return None
+        aliases = [a.strip() for a in aliases if isinstance(a, str) and a.strip()]
+        entity_type = _LLM_ENTITY_TYPE_MAP.get(str(item.get("type", "")).lower(), "PROPER")
+        key = " ".join(surface.strip().lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"surface": surface.strip(), "aliases": aliases, "type": entity_type})
+    return out
+
+
+def _sparse_capable(vector_store) -> bool:
+    # Strict identity: the capability must be explicitly declared True by the
+    # adapter, not merely truthy (guards against duck-typed accidents).
+    return getattr(vector_store, "supports_sparse_vectors", False) is True
+
+
+def _dual_embedder(embedding_model) -> bool:
+    # The dual-output method must be part of the provider's class interface.
+    return callable(getattr(type(embedding_model), "embed_batch_dual", None))
+
+
+def _learned_sparse_mode(vector_store) -> bool:
+    return getattr(vector_store, "sparse_encoder", None) == "learned"
+
+
+def _cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return cjk / len(text)
+
+
+def _should_rerank_conditional(config, query: str, candidates: list) -> bool:
+    """Zero-cost rerank triggers: query/candidate language mismatch (payload.lang)
+    or low best semantic score. Missing lang data never triggers the lang rule."""
+    query_is_cjk = _cjk_ratio(query) > 0.2
+    langs = [
+        (c.get("metadata") or {}).get("lang")
+        for c in candidates
+        if isinstance((c.get("metadata") or {}).get("lang"), str)
+    ]
+    if langs:
+        dominant = max(set(langs), key=langs.count)
+        if dominant.lower().startswith("zh") != query_is_cjk:
+            return True
+    threshold = config.rerank_semantic_threshold
+    if threshold is not None and candidates:
+        best = max(
+            (c.get("score_details") or {}).get("semantic_score") or c.get("score") or 0.0 for c in candidates
+        )
+        if best < threshold:
+            return True
+    return False
+
+
+def _fold_near_duplicates(scored_results: list, explain: bool = False) -> list:
+    """Cluster results by payload.near_duplicate_of (union-find).
+
+    Representative = newest updated_at (fact updates surface); cluster rank =
+    max member score. Applied before top_k truncation so duplicates do not
+    squeeze out distinct memories. History is never deleted (lossless).
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for result in scored_results:
+        target = (result.get("payload") or {}).get("near_duplicate_of")
+        if target:
+            ra, rb = find(result["id"]), find(str(target))
+            if ra != rb:
+                parent[ra] = rb
+
+    clusters = {}
+    for result in scored_results:
+        clusters.setdefault(find(result["id"]), []).append(result)
+
+    folded = []
+    for members in clusters.values():
+        representative = max(members, key=lambda r: (r.get("payload") or {}).get("updated_at") or "")
+        rep = dict(representative)
+        rep["score"] = max(r["score"] for r in members)
+        if explain and len(members) > 1:
+            details = dict(rep.get("score_details") or {})
+            details["near_duplicate_cluster"] = {
+                "representative": rep["id"],
+                "members": [r["id"] for r in members],
+                "folded_count": len(members) - 1,
+            }
+            rep["score_details"] = details
+        folded.append(rep)
+
+    folded.sort(key=lambda r: r["score"], reverse=True)
+    return folded
 
 
 # Fields that hold runtime auth/connection objects and must be preserved.
@@ -502,6 +690,12 @@ class Memory(MemoryBase):
         self.api_version = self.config.version
         self.custom_instructions = self.config.custom_instructions
 
+        self._model_profile = _resolve_model_profile(self.config, self.embedding_model)
+        self._version_stamps = _build_version_stamps(self.config, self.embedding_model)
+        self._write_block_reason = _check_version_stamps(self.vector_store, self._version_stamps)
+        if self._write_block_reason:
+            logger.error(self._write_block_reason)
+
         # Initialize reranker if configured
         self.reranker = None
         if config.reranker:
@@ -512,6 +706,7 @@ class Memory(MemoryBase):
 
         # Entity store is initialized lazily on first use
         self._entity_store = None
+        self._entity_dictionary = None
 
         if MEM0_TELEMETRY:
             # Create telemetry config manually to avoid deepcopy issues with thread locks
@@ -551,6 +746,46 @@ class Memory(MemoryBase):
 
         capture_event("mem0.init", self, {"sync_type": "sync"})
 
+    def _guard_write(self):
+        if self._write_block_reason:
+            raise ValueError(self._write_block_reason)
+
+    def _embed_texts_dual(self, texts, action):
+        """Batch embed returning (dense_list, sparse_list_or_None)."""
+        if _sparse_capable(self.vector_store) and _dual_embedder(self.embedding_model):
+            return self.embedding_model.embed_batch_dual(texts, action)
+        return self.embedding_model.embed_batch(texts, action), None
+
+    def _embed_text_dual(self, text, action):
+        """Single-text embed returning (dense, sparse_or_None)."""
+        if _sparse_capable(self.vector_store) and _dual_embedder(self.embedding_model):
+            dense, sparse = self.embedding_model.embed_batch_dual([text], action)
+            return dense[0], sparse[0]
+        return self.embedding_model.embed(text, action), None
+
+    def _text_for_sparse(self, text):
+        # Learned sparse encodes the original text; English lemmatization is
+        # only meaningful for the legacy BM25 path.
+        if _learned_sparse_mode(self.vector_store):
+            return text
+        return lemmatize_for_bm25(text)
+
+    def _near_duplicate_tag(self, embedding, filters):
+        """Top-1 ANN against the scoped store; tag only, never skip (lossless)."""
+        if not self.config.near_duplicate:
+            return {}
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        try:
+            matches = self.vector_store.search(query="", vectors=embedding, top_k=1, filters=search_filters)
+            if matches and matches[0].score >= self._model_profile.near_duplicate_threshold:
+                return {
+                    "near_duplicate_of": str(matches[0].id),
+                    "near_duplicate_similarity": float(matches[0].score),
+                }
+        except Exception as e:
+            logger.debug(f"Near-duplicate check failed: {e}")
+        return {}
+
     @property
     def project(self):
         return _OSSProject()
@@ -566,6 +801,11 @@ class Memory(MemoryBase):
                 entity_config.collection_name = entity_collection
             elif isinstance(entity_config, dict):
                 entity_config['collection_name'] = entity_collection
+            # Derived entity index: no sparse slot (rebuildable from payloads)
+            if hasattr(entity_config, 'sparse_encoder'):
+                entity_config.sparse_encoder = "none"
+            elif isinstance(entity_config, dict) and 'sparse_encoder' in entity_config:
+                entity_config['sparse_encoder'] = "none"
             # For Qdrant, share the existing client to avoid RocksDB lock contention
             # when using embedded mode (path=...). QdrantConfig.client takes precedence
             # over host/port/path.
@@ -578,6 +818,21 @@ class Memory(MemoryBase):
                 self.config.vector_store.provider, entity_config
             )
         return self._entity_store
+
+    @property
+    def entity_dictionary(self):
+        """Lazily initialized scope-aware entity dictionary cache."""
+        if self._entity_dictionary is None:
+            self._entity_dictionary = EntityDictionary(loader=self._load_entity_rows)
+        return self._entity_dictionary
+
+    def _load_entity_rows(self, search_filters):
+        listed = self.entity_store.list(filters=search_filters, top_k=10000)
+        return _vector_store_list_rows(listed)
+
+    def _invalidate_entity_dictionary(self):
+        if self._entity_dictionary is not None:
+            self._entity_dictionary.invalidate()
 
     @staticmethod
     def _normalize_entity_text(value: str) -> str:
@@ -600,9 +855,14 @@ class Memory(MemoryBase):
             normalized = self._normalize_entity_text(text)
             if normalized and normalized not in rows_by_text:
                 rows_by_text[normalized] = row
+            for alias in payload.get("aliases") or []:
+                if isinstance(alias, str):
+                    alias_key = self._normalize_entity_text(alias)
+                    if alias_key and alias_key not in rows_by_text:
+                        rows_by_text[alias_key] = row
         return rows_by_text
 
-    def _upsert_entity(self, entity_text, entity_type, memory_id, filters):
+    def _upsert_entity(self, entity_text, entity_type, memory_id, filters, aliases=None):
         """Upsert an entity into the entity store, linking it to a memory."""
         try:
             entity_embedding = self.embedding_model.embed(entity_text, "add")
@@ -618,15 +878,28 @@ class Memory(MemoryBase):
                     filters=search_filters,
                 )
 
-            semantic_match = existing[0] if existing and existing[0].score >= 0.95 else None
+            semantic_match = (
+                existing[0]
+                if existing and existing[0].score >= self._model_profile.entity_match_threshold
+                else None
+            )
             match = exact_match or semantic_match
             if match:
-                # Update existing entity's linked_memory_ids
+                # Update existing entity's linked_memory_ids and aliases
                 payload = match.payload or {}
                 linked_ids = payload.get("linked_memory_ids", [])
+                changed = False
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
                     payload["linked_memory_ids"] = linked_ids
+                    changed = True
+                if aliases:
+                    merged = set(payload.get("aliases") or []) | set(aliases)
+                    merged.discard(payload.get("data"))
+                    if merged != set(payload.get("aliases") or []):
+                        payload["aliases"] = sorted(merged)
+                        changed = True
+                if changed:
                     self.entity_store.update(
                         vector_id=match.id,
                         vector=None,
@@ -637,6 +910,7 @@ class Memory(MemoryBase):
                 entity_id = str(uuid.uuid4())
                 entity_payload = {
                     "data": entity_text,
+                    "aliases": sorted(set(aliases or [])),
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
                     **{k: v for k, v in search_filters.items()},
@@ -646,14 +920,17 @@ class Memory(MemoryBase):
                     ids=[entity_id],
                     payloads=[entity_payload],
                 )
+            self._invalidate_entity_dictionary()
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}': {e}")
 
-    def _remove_memory_from_entity_store(self, memory_id, filters):
+    def _remove_memory_from_entity_store(self, memory_id, filters, delete_empty=True):
         """Strip `memory_id` from every entity record scoped to `filters`.
 
         For each entity whose `linked_memory_ids` contains `memory_id`:
-          - remove the id; if the list becomes empty, delete the entity record.
+          - remove the id; if the list becomes empty, delete the entity record
+            (or keep it with an empty list when delete_empty=False, so the
+            update relink fallback can still find and re-append to it).
           - otherwise re-embed the entity text and update the payload
             (the vector store's update() requires a vector).
 
@@ -676,10 +953,20 @@ class Memory(MemoryBase):
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
-                        try:
-                            self.entity_store.delete(vector_id=row.id)
-                        except Exception as e:
-                            logger.debug(f"Entity delete failed for id={row.id}: {e}")
+                        if delete_empty:
+                            try:
+                                self.entity_store.delete(vector_id=row.id)
+                            except Exception as e:
+                                logger.debug(f"Entity delete failed for id={row.id}: {e}")
+                        else:
+                            try:
+                                self.entity_store.update(
+                                    vector_id=row.id,
+                                    vector=None,
+                                    payload={**payload, "linked_memory_ids": []},
+                                )
+                            except Exception as e:
+                                logger.debug(f"Entity empty-link update failed for id={row.id}: {e}")
                     else:
                         entity_text = payload.get("data")
                         if not isinstance(entity_text, str) or not entity_text:
@@ -701,15 +988,22 @@ class Memory(MemoryBase):
                             logger.debug(f"Entity update failed for id={row.id}: {e}")
                 except Exception as e:
                     logger.debug(f"Entity cleanup error: {e}")
+            self._invalidate_entity_dictionary()
         except Exception as e:
             logger.warning(f"Entity store cleanup failed for memory_id={memory_id}: {e}")
 
-    def _link_entities_for_memory(self, memory_id, text, filters):
-        """Extract entities from `text` and link them to `memory_id` in the
-        entity store, scoped to `filters`. Simpler single-memory variant of
-        Phase 7 in add(): per-entity search-then-update-or-insert via the
-        existing `_upsert_entity` helper. Non-fatal on any failure.
+    def _link_entities_for_memory(self, memory_id, text, filters, embedding=None):
+        """Link `memory_id` to entities for `text`, scoped to `filters`.
+
+        entity_source=llm: match existing entity records only (whole-text
+        vector fallback; the dictionary layer joins in S7). No spaCy/LLM and
+        no new entity creation on this path.
+        entity_source=spacy: legacy per-entity search-then-update-or-insert
+        via `_upsert_entity`. Non-fatal on any failure.
         """
+        if self.config.entity_source == "llm":
+            self._relink_entities_by_vector(memory_id, text, filters, embedding)
+            return
         try:
             entities = extract_entities(text)
             if not entities:
@@ -726,6 +1020,66 @@ class Memory(MemoryBase):
                     logger.debug(f"Entity link failed for '{entity_text}': {e}")
         except Exception as e:
             logger.warning(f"Entity linking failed for memory_id={memory_id}: {e}")
+
+    def _relink_entities_by_vector(self, memory_id, text, filters, embedding=None):
+        """Whole-text vector fallback: append memory_id to matching entity
+        records (payload-only, entities are not re-embedded). Gated by
+        Profile.entity_vector_threshold. Non-fatal."""
+        try:
+            search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+            if embedding is None:
+                embedding = self.embedding_model.embed(text, "update")
+            matches = self.entity_store.search(
+                query=text, vectors=embedding, top_k=10, filters=search_filters
+            )
+            for match in matches:
+                if match.score < self._model_profile.entity_vector_threshold:
+                    continue
+                payload = match.payload or {}
+                linked = payload.get("linked_memory_ids", [])
+                if not isinstance(linked, list) or memory_id in linked:
+                    continue
+                payload["linked_memory_ids"] = linked + [memory_id]
+                try:
+                    self.entity_store.update(vector_id=match.id, vector=None, payload=payload)
+                except Exception as e:
+                    logger.debug(f"Entity relink update failed for id={match.id}: {e}")
+        except Exception as e:
+            logger.warning(f"Entity vector relink failed for memory_id={memory_id}: {e}")
+
+    def rebuild_entity_index(self, filters=None):
+        """Rebuild the derived entity index from memory payloads (zero LLM calls).
+
+        payload.entities is the source of truth; memories without it fall
+        back to spaCy extraction. The entity collection is reset and
+        recreated from the current derived configuration (no sparse slot).
+        """
+        search_filters = {
+            k: v for k, v in (filters or {}).items() if k in ("user_id", "agent_id", "run_id") and v
+        }
+        store = self.entity_store
+        try:
+            store.reset()
+        except Exception as e:
+            logger.warning(f"Entity index reset failed during rebuild: {e}")
+        rows = _vector_store_list_rows(self.vector_store.list(filters=search_filters or None, top_k=10000))
+        entity_links = 0
+        for row in rows:
+            payload = getattr(row, "payload", None) or {}
+            memory_id = str(row.id)
+            entities = payload.get("entities")
+            if entities is None:
+                entities = [
+                    {"surface": surface, "aliases": [], "type": entity_type}
+                    for entity_type, surface in extract_entities(payload.get("data", ""))
+                ]
+            for ent in entities:
+                self._upsert_entity(
+                    ent["surface"], ent["type"], memory_id, search_filters, aliases=ent.get("aliases")
+                )
+                entity_links += 1
+        self._invalidate_entity_dictionary()
+        return {"rebuilt_memories": len(rows), "entity_links": entity_links}
 
     @classmethod
     def from_config(cls, config_dict: Dict[str, Any]):
@@ -879,6 +1233,7 @@ class Memory(MemoryBase):
         return {"results": vector_store_result}
 
     def _add_to_vector_store(self, messages, metadata, filters, infer, prompt=None):
+        self._guard_write()
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -901,8 +1256,10 @@ class Memory(MemoryBase):
                     per_msg_meta["actor_id"] = actor_name
 
                 msg_content = message_dict["content"]
-                msg_embeddings = self.embedding_model.embed(msg_content, "add")
-                mem_id = self._create_memory(msg_content, {msg_content: msg_embeddings}, per_msg_meta)
+                msg_embeddings, msg_sparse = self._embed_text_dual(msg_content, "add")
+                mem_id = self._create_memory(
+                    msg_content, {msg_content: msg_embeddings}, per_msg_meta, existing_sparse={msg_content: msg_sparse}
+                )
 
                 returned_memories.append(
                     {
@@ -952,6 +1309,8 @@ class Memory(MemoryBase):
             new_messages=parsed_messages,
             last_k_messages=last_messages,
             custom_instructions=custom_instr,
+            use_input_language=self.config.multilingual,
+            include_metadata=self.config.multilingual or self.config.entity_source == "llm",
         )
 
         try:
@@ -992,9 +1351,12 @@ class Memory(MemoryBase):
 
         # Phase 3: Batch embed all extracted memory texts
         mem_texts = [m.get("text", "") for m in extracted_memories if m.get("text")]
+        sparse_map = {}
         try:
-            mem_embeddings_list = self.embedding_model.embed_batch(mem_texts, "add")
+            mem_embeddings_list, sparse_list = self._embed_texts_dual(mem_texts, "add")
             embed_map = dict(zip(mem_texts, mem_embeddings_list))
+            if sparse_list is not None:
+                sparse_map = dict(zip(mem_texts, sparse_list))
         except Exception:
             # Fallback: embed individually
             embed_map = {}
@@ -1025,7 +1387,7 @@ class Memory(MemoryBase):
                 continue
             seen_hashes.add(mem_hash)
 
-            text_lemmatized = lemmatize_for_bm25(text)
+            text_lemmatized = self._text_for_sparse(text)
 
             memory_id = str(uuid.uuid4())
             mem_metadata = deepcopy(metadata)
@@ -1037,12 +1399,57 @@ class Memory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            if self.config.multilingual or self.config.entity_source == "llm":
+                if isinstance(mem.get("lang"), str) and mem["lang"].strip():
+                    mem_metadata["lang"] = mem["lang"].strip()
+                keywords = mem.get("keywords")
+                if isinstance(keywords, list):
+                    keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
+                    if keywords:
+                        mem_metadata["keywords"] = keywords
+                links = mem.get("linked_memory_ids")
+                if isinstance(links, list):
+                    resolved = [uuid_mapping[str(link)] for link in links if str(link) in uuid_mapping]
+                    if resolved:
+                        mem_metadata["linked_memory_ids"] = resolved
+            if self.config.entity_source == "llm":
+                validated_entities = _validate_llm_entities(mem.get("entities"))
+                if validated_entities is None:
+                    validated_entities = [
+                        {"surface": surface, "aliases": [], "type": entity_type}
+                        for entity_type, surface in extract_entities(text)
+                    ]
+                mem_metadata["entities"] = validated_entities
+            mem_metadata.update(self._version_stamps)
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
             self.db.save_messages(messages, session_scope)
             return []
+
+        # Phase 5.5: Lossless near-duplicate tagging (full-store top-1 ANN,
+        # reusing Phase 3 vectors; tagged records are still inserted).
+        if self.config.near_duplicate:
+            try:
+                try:
+                    match_lists = self.vector_store.search_batch(
+                        queries=[r[1] for r in records],
+                        vectors_list=[r[2] for r in records],
+                        top_k=1,
+                        filters=search_filters,
+                    )
+                except Exception:
+                    match_lists = [
+                        self.vector_store.search(query=r[1], vectors=r[2], top_k=1, filters=search_filters)
+                        for r in records
+                    ]
+                for rec, matches in zip(records, match_lists):
+                    if matches and matches[0].score >= self._model_profile.near_duplicate_threshold:
+                        rec[3]["near_duplicate_of"] = str(matches[0].id)
+                        rec[3]["near_duplicate_similarity"] = float(matches[0].score)
+            except Exception as e:
+                logger.debug(f"Near-duplicate tagging failed: {e}")
 
         # Phase 6: Batch persist
         all_vectors = [r[2] for r in records]
@@ -1053,18 +1460,27 @@ class Memory(MemoryBase):
         # links, and the returned results — a record the store rejected must
         # never be reported back as a successful ADD.
         persisted_records = []
+        insert_kwargs = {}
+        if sparse_map and _sparse_capable(self.vector_store):
+            insert_kwargs["sparse_vectors"] = [sparse_map.get(r[1]) for r in records]
         try:
             self.vector_store.insert(
                 vectors=all_vectors,
                 ids=all_ids,
                 payloads=all_payloads,
+                **insert_kwargs,
             )
             persisted_records = records
         except Exception:
             # Fallback: insert one by one
             for rec in records:
                 try:
-                    self.vector_store.insert(vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]])
+                    rec_kwargs = (
+                        {"sparse_vectors": [sparse_map.get(rec[1])]}
+                        if sparse_map and _sparse_capable(self.vector_store)
+                        else {}
+                    )
+                    self.vector_store.insert(vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]], **rec_kwargs)
                     persisted_records.append(rec)
                 except Exception as e:
                     logger.error(f"Failed to insert memory {rec[0]}: {e}")
@@ -1100,18 +1516,25 @@ class Memory(MemoryBase):
         # Phase 7: Batch entity linking
         try:
             all_texts = [r[1] for r in persisted_records]
-            all_entities = extract_entities_batch(all_texts)
+            if self.config.entity_source == "llm":
+                all_entities = [
+                    [(e["type"], e["surface"], e.get("aliases") or []) for e in r[3].get("entities", [])]
+                    for r in persisted_records
+                ]
+            else:
+                all_entities = [[(t, s, []) for t, s in ents] for ents in extract_entities_batch(all_texts)]
 
             # 7a: Global dedup — collect unique entities across all memories
-            global_entities = {}  # normalized_key -> (entity_type, entity_text, set of memory_ids)
+            global_entities = {}  # normalized_key -> [entity_type, entity_text, set of memory_ids, aliases]
             for idx, (memory_id, text, embedding, payload) in enumerate(persisted_records):
                 entities = all_entities[idx] if idx < len(all_entities) else []
-                for entity_type, entity_text in entities:
+                for entity_type, entity_text, aliases in entities:
                     key = self._normalize_entity_text(entity_text)
                     if key in global_entities:
                         global_entities[key][2].add(memory_id)
+                        global_entities[key][3] = sorted(set(global_entities[key][3]) | set(aliases))
                     else:
-                        global_entities[key] = [entity_type, entity_text, {memory_id}]
+                        global_entities[key] = [entity_type, entity_text, {memory_id}, sorted(set(aliases))]
 
             if global_entities:
                 ordered_keys = list(global_entities.keys())
@@ -1159,11 +1582,15 @@ class Memory(MemoryBase):
                     # 7d: Separate into inserts vs updates
                     to_insert_vectors, to_insert_ids, to_insert_payloads = [], [], []
                     for j, key in enumerate(valid_keys):
-                        entity_type, entity_text, memory_ids = global_entities[key]
+                        entity_type, entity_text, memory_ids, aliases = global_entities[key]
                         matches = existing_matches[j] if j < len(existing_matches) else []
                         exact_match = exact_matches.get(key)
 
-                        semantic_match = matches[0] if matches and matches[0].score >= 0.95 else None
+                        semantic_match = (
+                            matches[0]
+                            if matches and matches[0].score >= self._model_profile.entity_match_threshold
+                            else None
+                        )
                         match = exact_match or semantic_match
                         if match:
                             # Update existing entity
@@ -1171,6 +1598,10 @@ class Memory(MemoryBase):
                             linked = set(payload.get("linked_memory_ids", []))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
+                            if aliases:
+                                merged_aliases = set(payload.get("aliases") or []) | set(aliases)
+                                merged_aliases.discard(payload.get("data"))
+                                payload["aliases"] = sorted(merged_aliases)
                             try:
                                 self.entity_store.update(
                                     vector_id=match.id,
@@ -1185,6 +1616,7 @@ class Memory(MemoryBase):
                             to_insert_ids.append(str(uuid.uuid4()))
                             to_insert_payloads.append({
                                 "data": entity_text,
+                                "aliases": aliases,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
                                 **search_filters,
@@ -1200,6 +1632,7 @@ class Memory(MemoryBase):
                             )
                         except Exception as e:
                             logger.warning(f"Batch entity insert failed: {e}")
+            self._invalidate_entity_dictionary()
         except Exception as e:
             logger.warning(f"Batch entity linking failed: {e}")
 
@@ -1396,7 +1829,7 @@ class Memory(MemoryBase):
         *,
         top_k: int = 20,
         filters: Optional[Dict[str, Any]] = None,
-        threshold: float = 0.1,
+        threshold: Optional[float] = None,
         rerank: bool = False,
         explain: bool = False,
         reference_date: Optional[Any] = None,
@@ -1429,7 +1862,8 @@ class Memory(MemoryBase):
                 - {"AND": [filter1, filter2]} - logical AND
                 - {"OR": [filter1, filter2]} - logical OR
                 - {"NOT": [filter1]} - logical NOT
-            threshold (float, optional): Minimum score for a memory to be included. Defaults to 0.1.
+            threshold (float, optional): Minimum score for a memory to be included. Defaults to the
+                embedding model profile's semantic_threshold (0.1 for the default profile).
             rerank (bool, optional): Whether to rerank results. Defaults to False.
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
@@ -1510,13 +1944,19 @@ class Memory(MemoryBase):
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
-        # Apply reranking if enabled and reranker is available
+        # Apply reranking if enabled and reranker is available (top-N scoped,
+        # optional conditional trigger; failure falls back to original results)
         if rerank and self.reranker and original_memories:
-            try:
-                reranked_memories = self.reranker.rerank(query, original_memories, limit)
-                original_memories = reranked_memories
-            except Exception as e:
-                logger.warning(f"Reranking failed, using original results: {e}")
+            candidates = original_memories[: self.config.rerank_top_n]
+            should_rerank = self.config.rerank_trigger != "conditional" or _should_rerank_conditional(
+                self.config, query, candidates
+            )
+            if should_rerank:
+                try:
+                    reranked_memories = self.reranker.rerank(query, candidates, limit)
+                    original_memories = (reranked_memories + original_memories[len(candidates):])[:limit]
+                except Exception as e:
+                    logger.warning(f"Reranking failed, using original results: {e}")
 
         if temporal_usage_notice:
             display_temporal_usage_notice(self, "sync", "search", *temporal_usage_notice)
@@ -1639,17 +2079,18 @@ class Memory(MemoryBase):
                 return True
         return False
 
-    def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, show_expired=False):
-        # Guard against None threshold (backward compat)
+    def _search_vector_store(self, query, filters, limit, threshold=None, explain=False, show_expired=False):
+        # Resolve the semantic threshold from the model profile when not given explicitly
         if threshold is None:
-            threshold = 0.1
+            threshold = self._model_profile.semantic_threshold
 
         # Step 1: Preprocess query
-        query_lemmatized = lemmatize_for_bm25(query)
-        query_entities = extract_entities(query)
+        query_lemmatized = self._text_for_sparse(query)
+        use_dictionary = self.config.entity_source == "llm" or self.config.multilingual
+        query_entities = [] if use_dictionary else extract_entities(query)
 
-        # Step 2: Embed query
-        embeddings = self.embedding_model.embed(query, "search")
+        # Step 2: Embed query (one forward pass yields dense + sparse when available)
+        embeddings, query_sparse = self._embed_text_dual(query, "search")
 
         # Step 3: Semantic search (over-fetch for scoring pool)
         internal_limit = max(limit * 4, 60)
@@ -1658,13 +2099,29 @@ class Memory(MemoryBase):
         )
 
         # Step 4: Keyword search (if store supports it)
-        keyword_results = self.vector_store.keyword_search(
-            query=query_lemmatized, top_k=internal_limit, filters=filters
-        )
+        learned_mode = _learned_sparse_mode(self.vector_store) and query_sparse is not None
+        if learned_mode:
+            keyword_results = self.vector_store.keyword_search(
+                query=query, top_k=internal_limit, filters=filters, sparse_vector=query_sparse
+            )
+        else:
+            keyword_results = self.vector_store.keyword_search(
+                query=query_lemmatized, top_k=internal_limit, filters=filters
+            )
 
-        # Step 5: Compute BM25 scores from keyword results
+        # Step 5: Compute normalized keyword scores from keyword results
         bm25_scores = {}
-        if keyword_results is not None:
+        if keyword_results is not None and learned_mode:
+            query_self_score = sum(v * v for v in query_sparse["values"])
+            zero_floor = self._model_profile.sparse_zero_floor
+            for mem in keyword_results:
+                mem_id = str(mem.id) if hasattr(mem, 'id') else str(mem.get('id', ''))
+                raw_score = mem.score if hasattr(mem, 'score') else mem.get('score', 0)
+                if raw_score and raw_score > 0:
+                    normalized = normalize_sparse_coverage(raw_score, query_self_score, zero_floor)
+                    if normalized > 0:
+                        bm25_scores[mem_id] = normalized
+        elif keyword_results is not None:
             midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
             for mem in keyword_results:
                 mem_id = str(mem.id) if hasattr(mem, 'id') else str(mem.get('id', ''))
@@ -1674,7 +2131,9 @@ class Memory(MemoryBase):
 
         # Step 6: Compute entity boosts
         entity_boosts = {}
-        if query_entities:
+        if use_dictionary:
+            entity_boosts = self._compute_entity_boosts_multilingual(query, filters, embeddings)
+        elif query_entities:
             entity_boosts = self._compute_entity_boosts(query_entities, filters)
 
         # Step 7: Build candidate set from semantic results
@@ -1690,15 +2149,17 @@ class Memory(MemoryBase):
                 "payload": payload,
             })
 
-        # Step 8: Score and rank
+        # Step 8: Score and rank (fold before top_k truncation when enabled)
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
             entity_boosts=entity_boosts,
             threshold=threshold,
-            top_k=limit,
+            top_k=len(candidates) if self.config.near_duplicate else limit,
             explain=explain,
         )
+        if self.config.near_duplicate:
+            scored_results = _fold_near_duplicates(scored_results, explain=explain)[:limit]
 
         # Step 9: Format results
         promoted_payload_keys = [
@@ -1826,6 +2287,48 @@ class Memory(MemoryBase):
 
         return memory_boosts
 
+    def _entity_vector_matches(self, embedding, filters, top_k=500):
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        return self.entity_store.search(query="", vectors=embedding, top_k=top_k, filters=search_filters)
+
+    def _compute_entity_boosts_multilingual(self, query, filters, query_embedding):
+        """Two-layer entity boosts: alias dictionary first, whole-query vector
+        fallback second (design doc 4.3). Boost formula identical to the legacy
+        path; dictionary hits score sim=1.0, fallback hits score their cosine.
+        """
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        memory_boosts = {}
+
+        def _apply(linked_memory_ids, similarity):
+            if not isinstance(linked_memory_ids, list):
+                return
+            num_linked = max(len(linked_memory_ids), 1)
+            memory_count_weight = 1.0 / (1.0 + 0.001 * ((num_linked - 1) ** 2))
+            boost = similarity * ENTITY_BOOST_WEIGHT * memory_count_weight
+            for memory_id in linked_memory_ids:
+                if memory_id:
+                    memory_key = str(memory_id)
+                    memory_boosts[memory_key] = max(memory_boosts.get(memory_key, 0.0), boost)
+
+        try:
+            for row in self.entity_dictionary.match(query, search_filters):
+                payload = getattr(row, "payload", None) or {}
+                _apply(payload.get("linked_memory_ids", []), 1.0)
+        except Exception as e:
+            logger.warning(f"Entity dictionary match failed: {e}")
+
+        try:
+            for match in self._entity_vector_matches(query_embedding, filters):
+                similarity = match.score if hasattr(match, "score") else 0.0
+                if similarity < self._model_profile.entity_vector_threshold:
+                    continue
+                payload = match.payload if hasattr(match, "payload") else {}
+                _apply(payload.get("linked_memory_ids", []), similarity)
+        except Exception as e:
+            logger.warning(f"Entity vector fallback failed: {e}")
+
+        return memory_boosts
+
     def update(
         self,
         memory_id,
@@ -1873,10 +2376,17 @@ class Memory(MemoryBase):
             update_metadata["expiration_date"] = _normalize_expiration_date(expiration_date)
 
         existing_embeddings = {}
+        existing_sparse = {}
         if text is not None:
-            existing_embeddings[text] = self.embedding_model.embed(text, "update")
+            dense, sparse = self._embed_text_dual(text, "update")
+            existing_embeddings[text] = dense
+            existing_sparse[text] = sparse
 
-        self._update_memory(memory_id, text, existing_embeddings, update_metadata)
+        sparse_arg = existing_sparse if any(v is not None for v in existing_sparse.values()) else None
+        if sparse_arg is not None:
+            self._update_memory(memory_id, text, existing_embeddings, update_metadata, existing_sparse=sparse_arg)
+        else:
+            self._update_memory(memory_id, text, existing_embeddings, update_metadata)
         display_first_run_notice(self, "sync", "update")
         return {"message": "Memory updated successfully!"}
 
@@ -1972,12 +2482,14 @@ class Memory(MemoryBase):
         display_first_run_notice(self, "sync", "history")
         return history
 
-    def _create_memory(self, data, existing_embeddings, metadata=None):
+    def _create_memory(self, data, existing_embeddings, metadata=None, existing_sparse=None):
         logger.debug(f"Creating memory with {data=}")
+        self._guard_write()
+        sparse_vector = (existing_sparse or {}).get(data)
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
-            embeddings = self.embedding_model.embed(data, memory_action="add")
+            embeddings, sparse_vector = self._embed_text_dual(data, "add")
         memory_id = str(uuid.uuid4())
         new_metadata = deepcopy(metadata) if metadata is not None else {}
         new_metadata["data"] = data
@@ -1985,12 +2497,20 @@ class Memory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = self._text_for_sparse(data)
+        new_metadata.update(self._version_stamps)
+        new_metadata.update(self._near_duplicate_tag(embeddings, new_metadata))
 
+        insert_kwargs = (
+            {"sparse_vectors": [sparse_vector]}
+            if sparse_vector is not None and _sparse_capable(self.vector_store)
+            else {}
+        )
         self.vector_store.insert(
             vectors=[embeddings],
             ids=[memory_id],
             payloads=[new_metadata],
+            **insert_kwargs,
         )
         self.db.add_history(
             memory_id,
@@ -2049,8 +2569,9 @@ class Memory(MemoryBase):
 
         return result
 
-    def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
+    def _update_memory(self, memory_id, data, existing_embeddings, metadata=None, existing_sparse=None):
         logger.info(f"Updating memory with {data=}")
+        self._guard_write()
 
         try:
             existing_memory = self.vector_store.get(vector_id=memory_id)
@@ -2075,19 +2596,27 @@ class Memory(MemoryBase):
 
         new_metadata["data"] = data
         new_metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = self._text_for_sparse(data)
+        new_metadata.update(self._version_stamps)
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
+            sparse_vector = (existing_sparse or {}).get(data)
         else:
-            embeddings = self.embedding_model.embed(data, "update")
+            embeddings, sparse_vector = self._embed_text_dual(data, "update")
 
+        update_kwargs = (
+            {"sparse_vector": sparse_vector}
+            if sparse_vector is not None and _sparse_capable(self.vector_store)
+            else {}
+        )
         updated = self.vector_store.update(
             vector_id=memory_id,
             vector=embeddings,
             payload=new_metadata,
+            **update_kwargs,
         )
         if updated is False:
             raise ValueError(f"Memory with id {memory_id} not found. Please provide a valid 'memory_id'")
@@ -2108,8 +2637,8 @@ class Memory(MemoryBase):
         # then re-extract entities from the new text and link them back.
         session_filters = {k: new_metadata[k] for k in ("user_id", "agent_id", "run_id") if new_metadata.get(k)}
         if text_changed:
-            self._remove_memory_from_entity_store(memory_id, session_filters)
-            self._link_entities_for_memory(memory_id, data, session_filters)
+            self._remove_memory_from_entity_store(memory_id, session_filters, delete_empty=False)
+            self._link_entities_for_memory(memory_id, data, session_filters, embedding=embeddings)
 
         return memory_id
 
@@ -2210,6 +2739,13 @@ class AsyncMemory(MemoryBase):
         self.api_version = self.config.version
         self.custom_instructions = self.config.custom_instructions
         self._entity_store = None
+        self._entity_dictionary = None
+
+        self._model_profile = _resolve_model_profile(self.config, self.embedding_model)
+        self._version_stamps = _build_version_stamps(self.config, self.embedding_model)
+        self._write_block_reason = _check_version_stamps(self.vector_store, self._version_stamps)
+        if self._write_block_reason:
+            logger.error(self._write_block_reason)
 
         # Initialize reranker if configured
         self.reranker = None
@@ -2239,6 +2775,46 @@ class AsyncMemory(MemoryBase):
 
         capture_event("mem0.init", self, {"sync_type": "async"})
 
+    def _guard_write(self):
+        if self._write_block_reason:
+            raise ValueError(self._write_block_reason)
+
+    def _embed_texts_dual(self, texts, action):
+        """Batch embed returning (dense_list, sparse_list_or_None)."""
+        if _sparse_capable(self.vector_store) and _dual_embedder(self.embedding_model):
+            return self.embedding_model.embed_batch_dual(texts, action)
+        return self.embedding_model.embed_batch(texts, action), None
+
+    def _embed_text_dual(self, text, action):
+        """Single-text embed returning (dense, sparse_or_None)."""
+        if _sparse_capable(self.vector_store) and _dual_embedder(self.embedding_model):
+            dense, sparse = self.embedding_model.embed_batch_dual([text], action)
+            return dense[0], sparse[0]
+        return self.embedding_model.embed(text, action), None
+
+    def _text_for_sparse(self, text):
+        if _learned_sparse_mode(self.vector_store):
+            return text
+        return lemmatize_for_bm25(text)
+
+    async def _near_duplicate_tag_async(self, embedding, filters):
+        """Async variant of `_near_duplicate_tag`."""
+        if not self.config.near_duplicate:
+            return {}
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        try:
+            matches = await asyncio.to_thread(
+                self.vector_store.search, query="", vectors=embedding, top_k=1, filters=search_filters
+            )
+            if matches and matches[0].score >= self._model_profile.near_duplicate_threshold:
+                return {
+                    "near_duplicate_of": str(matches[0].id),
+                    "near_duplicate_similarity": float(matches[0].score),
+                }
+        except Exception as e:
+            logger.debug(f"Near-duplicate check failed (async): {e}")
+        return {}
+
     @property
     def project(self):
         return _AsyncOSSProject()
@@ -2253,6 +2829,11 @@ class AsyncMemory(MemoryBase):
                 entity_config.collection_name = entity_collection
             elif isinstance(entity_config, dict):
                 entity_config['collection_name'] = entity_collection
+            # Derived entity index: no sparse slot (rebuildable from payloads)
+            if hasattr(entity_config, 'sparse_encoder'):
+                entity_config.sparse_encoder = "none"
+            elif isinstance(entity_config, dict) and 'sparse_encoder' in entity_config:
+                entity_config['sparse_encoder'] = "none"
             # For Qdrant, share the existing client to avoid RocksDB lock contention
             # when using embedded mode (path=...). QdrantConfig.client takes precedence
             # over host/port/path.
@@ -2265,6 +2846,21 @@ class AsyncMemory(MemoryBase):
                 self.config.vector_store.provider, entity_config
             )
         return self._entity_store
+
+    @property
+    def entity_dictionary(self):
+        """Lazily initialized scope-aware entity dictionary cache."""
+        if self._entity_dictionary is None:
+            self._entity_dictionary = EntityDictionary(loader=self._load_entity_rows)
+        return self._entity_dictionary
+
+    def _load_entity_rows(self, search_filters):
+        listed = self.entity_store.list(filters=search_filters, top_k=10000)
+        return _vector_store_list_rows(listed)
+
+    def _invalidate_entity_dictionary(self):
+        if self._entity_dictionary is not None:
+            self._entity_dictionary.invalidate()
 
     @staticmethod
     def _normalize_entity_text(value: str) -> str:
@@ -2287,9 +2883,14 @@ class AsyncMemory(MemoryBase):
             normalized = self._normalize_entity_text(text)
             if normalized and normalized not in rows_by_text:
                 rows_by_text[normalized] = row
+            for alias in payload.get("aliases") or []:
+                if isinstance(alias, str):
+                    alias_key = self._normalize_entity_text(alias)
+                    if alias_key and alias_key not in rows_by_text:
+                        rows_by_text[alias_key] = row
         return rows_by_text
 
-    async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters):
+    async def _upsert_entity_async(self, entity_text, entity_type, memory_id, filters, aliases=None):
         """Async variant of `_upsert_entity` — per-entity search-then-update-or-insert."""
         try:
             entity_embedding = await asyncio.to_thread(self.embedding_model.embed, entity_text, "add")
@@ -2308,14 +2909,27 @@ class AsyncMemory(MemoryBase):
                     filters=search_filters,
                 )
 
-            semantic_match = existing[0] if existing and existing[0].score >= 0.95 else None
+            semantic_match = (
+                existing[0]
+                if existing and existing[0].score >= self._model_profile.entity_match_threshold
+                else None
+            )
             match = exact_match or semantic_match
             if match:
                 payload = match.payload or {}
                 linked_ids = payload.get("linked_memory_ids", [])
+                changed = False
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
                     payload["linked_memory_ids"] = linked_ids
+                    changed = True
+                if aliases:
+                    merged = set(payload.get("aliases") or []) | set(aliases)
+                    merged.discard(payload.get("data"))
+                    if merged != set(payload.get("aliases") or []):
+                        payload["aliases"] = sorted(merged)
+                        changed = True
+                if changed:
                     await asyncio.to_thread(
                         self.entity_store.update,
                         vector_id=match.id,
@@ -2326,6 +2940,7 @@ class AsyncMemory(MemoryBase):
                 entity_id = str(uuid.uuid4())
                 entity_payload = {
                     "data": entity_text,
+                    "aliases": sorted(set(aliases or [])),
                     "entity_type": entity_type,
                     "linked_memory_ids": [memory_id],
                     **{k: v for k, v in search_filters.items()},
@@ -2336,6 +2951,7 @@ class AsyncMemory(MemoryBase):
                     ids=[entity_id],
                     payloads=[entity_payload],
                 )
+            await asyncio.to_thread(self._invalidate_entity_dictionary)
         except Exception as e:
             logger.warning(f"Entity upsert failed for '{entity_text}' (async): {e}")
 
@@ -2357,10 +2973,11 @@ class AsyncMemory(MemoryBase):
                     await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
                 except Exception as e:
                     logger.debug(f"Bulk entity delete failed for id={row.id}: {e}")
+            await asyncio.to_thread(self._invalidate_entity_dictionary)
         except Exception as e:
             logger.warning(f"Bulk entity store cleanup failed: {e}")
 
-    async def _remove_memory_from_entity_store(self, memory_id, filters):
+    async def _remove_memory_from_entity_store(self, memory_id, filters, delete_empty=True):
         """Async variant of `Memory._remove_memory_from_entity_store`."""
         if self._entity_store is None:
             return
@@ -2376,10 +2993,21 @@ class AsyncMemory(MemoryBase):
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
-                        try:
-                            await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
-                        except Exception as e:
-                            logger.debug(f"Entity delete failed for id={row.id} (async): {e}")
+                        if delete_empty:
+                            try:
+                                await asyncio.to_thread(self.entity_store.delete, vector_id=row.id)
+                            except Exception as e:
+                                logger.debug(f"Entity delete failed for id={row.id} (async): {e}")
+                        else:
+                            try:
+                                await asyncio.to_thread(
+                                    self.entity_store.update,
+                                    vector_id=row.id,
+                                    vector=None,
+                                    payload={**payload, "linked_memory_ids": []},
+                                )
+                            except Exception as e:
+                                logger.debug(f"Entity empty-link update failed for id={row.id} (async): {e}")
                     else:
                         entity_text = payload.get("data")
                         if not isinstance(entity_text, str) or not entity_text:
@@ -2402,11 +3030,15 @@ class AsyncMemory(MemoryBase):
                             logger.debug(f"Entity update failed for id={row.id} (async): {e}")
                 except Exception as e:
                     logger.debug(f"Entity cleanup error (async): {e}")
+            await asyncio.to_thread(self._invalidate_entity_dictionary)
         except Exception as e:
             logger.warning(f"Entity store cleanup failed for memory_id={memory_id} (async): {e}")
 
-    async def _link_entities_for_memory(self, memory_id, text, filters):
+    async def _link_entities_for_memory(self, memory_id, text, filters, embedding=None):
         """Async variant of `Memory._link_entities_for_memory`."""
+        if self.config.entity_source == "llm":
+            await self._relink_entities_by_vector_async(memory_id, text, filters, embedding)
+            return
         try:
             entities = await asyncio.to_thread(extract_entities, text)
             if not entities:
@@ -2423,6 +3055,63 @@ class AsyncMemory(MemoryBase):
                     logger.debug(f"Entity link failed for '{entity_text}' (async): {e}")
         except Exception as e:
             logger.warning(f"Entity linking failed for memory_id={memory_id} (async): {e}")
+
+    async def _relink_entities_by_vector_async(self, memory_id, text, filters, embedding=None):
+        """Async variant of `Memory._relink_entities_by_vector`."""
+        try:
+            search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+            if embedding is None:
+                embedding = await asyncio.to_thread(self.embedding_model.embed, text, "update")
+            matches = await asyncio.to_thread(
+                self.entity_store.search, query=text, vectors=embedding, top_k=10, filters=search_filters
+            )
+            for match in matches:
+                if match.score < self._model_profile.entity_vector_threshold:
+                    continue
+                payload = match.payload or {}
+                linked = payload.get("linked_memory_ids", [])
+                if not isinstance(linked, list) or memory_id in linked:
+                    continue
+                payload["linked_memory_ids"] = linked + [memory_id]
+                try:
+                    await asyncio.to_thread(
+                        self.entity_store.update, vector_id=match.id, vector=None, payload=payload
+                    )
+                except Exception as e:
+                    logger.debug(f"Entity relink update failed for id={match.id} (async): {e}")
+        except Exception as e:
+            logger.warning(f"Entity vector relink failed for memory_id={memory_id} (async): {e}")
+
+    async def rebuild_entity_index(self, filters=None):
+        """Async variant of `Memory.rebuild_entity_index` (zero LLM calls)."""
+        search_filters = {
+            k: v for k, v in (filters or {}).items() if k in ("user_id", "agent_id", "run_id") and v
+        }
+        store = self.entity_store
+        try:
+            await asyncio.to_thread(store.reset)
+        except Exception as e:
+            logger.warning(f"Entity index reset failed during rebuild (async): {e}")
+        rows = _vector_store_list_rows(
+            await asyncio.to_thread(self.vector_store.list, filters=search_filters or None, top_k=10000)
+        )
+        entity_links = 0
+        for row in rows:
+            payload = getattr(row, "payload", None) or {}
+            memory_id = str(row.id)
+            entities = payload.get("entities")
+            if entities is None:
+                entities = [
+                    {"surface": surface, "aliases": [], "type": entity_type}
+                    for entity_type, surface in await asyncio.to_thread(extract_entities, payload.get("data", ""))
+                ]
+            for ent in entities:
+                await self._upsert_entity_async(
+                    ent["surface"], ent["type"], memory_id, search_filters, aliases=ent.get("aliases")
+                )
+                entity_links += 1
+        self._invalidate_entity_dictionary()
+        return {"rebuilt_memories": len(rows), "entity_links": entity_links}
 
     @classmethod
     def from_config(cls, config_dict: Dict[str, Any]):
@@ -2563,6 +3252,7 @@ class AsyncMemory(MemoryBase):
         infer: bool,
         prompt: Optional[str] = None,
     ):
+        self._guard_write()
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -2585,8 +3275,10 @@ class AsyncMemory(MemoryBase):
                     per_msg_meta["actor_id"] = actor_name
 
                 msg_content = message_dict["content"]
-                msg_embeddings = await asyncio.to_thread(self.embedding_model.embed, msg_content, "add")
-                mem_id = await self._create_memory(msg_content, {msg_content: msg_embeddings}, per_msg_meta)
+                msg_embeddings, msg_sparse = await asyncio.to_thread(self._embed_text_dual, msg_content, "add")
+                mem_id = await self._create_memory(
+                    msg_content, {msg_content: msg_embeddings}, per_msg_meta, existing_sparse={msg_content: msg_sparse}
+                )
 
                 returned_memories.append(
                     {
@@ -2637,6 +3329,8 @@ class AsyncMemory(MemoryBase):
             new_messages=parsed_messages,
             last_k_messages=last_messages,
             custom_instructions=custom_instr,
+            use_input_language=self.config.multilingual,
+            include_metadata=self.config.multilingual or self.config.entity_source == "llm",
         )
 
         try:
@@ -2675,9 +3369,12 @@ class AsyncMemory(MemoryBase):
 
         # Phase 3: Batch embed all extracted memory texts
         mem_texts = [m.get("text", "") for m in extracted_memories if m.get("text")]
+        sparse_map = {}
         try:
-            mem_embeddings_list = await asyncio.to_thread(self.embedding_model.embed_batch, mem_texts, "add")
+            mem_embeddings_list, sparse_list = await asyncio.to_thread(self._embed_texts_dual, mem_texts, "add")
             embed_map = dict(zip(mem_texts, mem_embeddings_list))
+            if sparse_list is not None:
+                sparse_map = dict(zip(mem_texts, sparse_list))
         except Exception:
             embed_map = {}
             for text in mem_texts:
@@ -2706,7 +3403,7 @@ class AsyncMemory(MemoryBase):
                 continue
             seen_hashes.add(mem_hash)
 
-            text_lemmatized = lemmatize_for_bm25(text)
+            text_lemmatized = self._text_for_sparse(text)
 
             memory_id = str(uuid.uuid4())
             mem_metadata = deepcopy(metadata)
@@ -2718,12 +3415,60 @@ class AsyncMemory(MemoryBase):
             mem_metadata["updated_at"] = mem_metadata["created_at"]
             if mem.get("attributed_to"):
                 mem_metadata["attributed_to"] = mem["attributed_to"]
+            if self.config.multilingual or self.config.entity_source == "llm":
+                if isinstance(mem.get("lang"), str) and mem["lang"].strip():
+                    mem_metadata["lang"] = mem["lang"].strip()
+                keywords = mem.get("keywords")
+                if isinstance(keywords, list):
+                    keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
+                    if keywords:
+                        mem_metadata["keywords"] = keywords
+                links = mem.get("linked_memory_ids")
+                if isinstance(links, list):
+                    resolved = [uuid_mapping[str(link)] for link in links if str(link) in uuid_mapping]
+                    if resolved:
+                        mem_metadata["linked_memory_ids"] = resolved
+            if self.config.entity_source == "llm":
+                validated_entities = _validate_llm_entities(mem.get("entities"))
+                if validated_entities is None:
+                    validated_entities = [
+                        {"surface": surface, "aliases": [], "type": entity_type}
+                        for entity_type, surface in extract_entities(text)
+                    ]
+                mem_metadata["entities"] = validated_entities
+            mem_metadata.update(self._version_stamps)
 
             records.append((memory_id, text, embed_map[text], mem_metadata))
 
         if not records:
             await asyncio.to_thread(self.db.save_messages, messages, session_scope)
             return []
+
+        # Phase 5.5: Lossless near-duplicate tagging (async)
+        if self.config.near_duplicate:
+            try:
+                try:
+                    match_lists = await asyncio.to_thread(
+                        self.vector_store.search_batch,
+                        queries=[r[1] for r in records],
+                        vectors_list=[r[2] for r in records],
+                        top_k=1,
+                        filters=search_filters,
+                    )
+                except Exception:
+                    match_lists = []
+                    for r in records:
+                        match_lists.append(
+                            await asyncio.to_thread(
+                                self.vector_store.search, query=r[1], vectors=r[2], top_k=1, filters=search_filters
+                            )
+                        )
+                for rec, matches in zip(records, match_lists):
+                    if matches and matches[0].score >= self._model_profile.near_duplicate_threshold:
+                        rec[3]["near_duplicate_of"] = str(matches[0].id)
+                        rec[3]["near_duplicate_similarity"] = float(matches[0].score)
+            except Exception as e:
+                logger.debug(f"Near-duplicate tagging failed (async): {e}")
 
         # Phase 6: Batch persist
         all_vectors = [r[2] for r in records]
@@ -2734,19 +3479,28 @@ class AsyncMemory(MemoryBase):
         # links, and the returned results — a record the store rejected must
         # never be reported back as a successful ADD.
         persisted_records = []
+        insert_kwargs = {}
+        if sparse_map and _sparse_capable(self.vector_store):
+            insert_kwargs["sparse_vectors"] = [sparse_map.get(r[1]) for r in records]
         try:
             await asyncio.to_thread(
                 self.vector_store.insert,
                 vectors=all_vectors,
                 ids=all_ids,
                 payloads=all_payloads,
+                **insert_kwargs,
             )
             persisted_records = records
         except Exception:
             for rec in records:
                 try:
+                    rec_kwargs = (
+                        {"sparse_vectors": [sparse_map.get(rec[1])]}
+                        if sparse_map and _sparse_capable(self.vector_store)
+                        else {}
+                    )
                     await asyncio.to_thread(
-                        self.vector_store.insert, vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]]
+                        self.vector_store.insert, vectors=[rec[2]], ids=[rec[0]], payloads=[rec[3]], **rec_kwargs
                     )
                     persisted_records.append(rec)
                 except Exception as e:
@@ -2785,18 +3539,28 @@ class AsyncMemory(MemoryBase):
         # Phase 7: Batch entity linking
         try:
             all_texts = [r[1] for r in persisted_records]
-            all_entities = await asyncio.to_thread(extract_entities_batch, all_texts)
+            if self.config.entity_source == "llm":
+                all_entities = [
+                    [(e["type"], e["surface"], e.get("aliases") or []) for e in r[3].get("entities", [])]
+                    for r in persisted_records
+                ]
+            else:
+                all_entities = [
+                    [(t, s, []) for t, s in ents]
+                    for ents in await asyncio.to_thread(extract_entities_batch, all_texts)
+                ]
 
             # 7a: Global dedup
             global_entities = {}
             for idx, (memory_id, text, embedding, payload) in enumerate(persisted_records):
                 entities = all_entities[idx] if idx < len(all_entities) else []
-                for entity_type, entity_text in entities:
+                for entity_type, entity_text, aliases in entities:
                     key = self._normalize_entity_text(entity_text)
                     if key in global_entities:
                         global_entities[key][2].add(memory_id)
+                        global_entities[key][3] = sorted(set(global_entities[key][3]) | set(aliases))
                     else:
-                        global_entities[key] = [entity_type, entity_text, {memory_id}]
+                        global_entities[key] = [entity_type, entity_text, {memory_id}, sorted(set(aliases))]
 
             if global_entities:
                 ordered_keys = list(global_entities.keys())
@@ -2842,17 +3606,25 @@ class AsyncMemory(MemoryBase):
                     # 7d: Separate into inserts vs updates
                     to_insert_vectors, to_insert_ids, to_insert_payloads = [], [], []
                     for j, key in enumerate(valid_keys):
-                        entity_type, entity_text, memory_ids = global_entities[key]
+                        entity_type, entity_text, memory_ids, aliases = global_entities[key]
                         matches = existing_matches[j] if j < len(existing_matches) else []
                         exact_match = exact_matches.get(key)
 
-                        semantic_match = matches[0] if matches and matches[0].score >= 0.95 else None
+                        semantic_match = (
+                            matches[0]
+                            if matches and matches[0].score >= self._model_profile.entity_match_threshold
+                            else None
+                        )
                         match = exact_match or semantic_match
                         if match:
                             payload = match.payload or {}
                             linked = set(payload.get("linked_memory_ids", []))
                             linked |= memory_ids
                             payload["linked_memory_ids"] = sorted(linked)
+                            if aliases:
+                                merged_aliases = set(payload.get("aliases") or []) | set(aliases)
+                                merged_aliases.discard(payload.get("data"))
+                                payload["aliases"] = sorted(merged_aliases)
                             try:
                                 await asyncio.to_thread(
                                     self.entity_store.update,
@@ -2867,6 +3639,7 @@ class AsyncMemory(MemoryBase):
                             to_insert_ids.append(str(uuid.uuid4()))
                             to_insert_payloads.append({
                                 "data": entity_text,
+                                "aliases": aliases,
                                 "entity_type": entity_type,
                                 "linked_memory_ids": sorted(memory_ids),
                                 **search_filters,
@@ -2883,6 +3656,7 @@ class AsyncMemory(MemoryBase):
                             )
                         except Exception as e:
                             logger.warning(f"Batch entity insert failed (async): {e}")
+            await asyncio.to_thread(self._invalidate_entity_dictionary)
         except Exception as e:
             logger.warning(f"Batch entity linking failed (async): {e}")
 
@@ -3079,7 +3853,7 @@ class AsyncMemory(MemoryBase):
         *,
         top_k: int = 20,
         filters: Optional[Dict[str, Any]] = None,
-        threshold: float = 0.1,
+        threshold: Optional[float] = None,
         rerank: bool = False,
         explain: bool = False,
         reference_date: Optional[Any] = None,
@@ -3112,7 +3886,8 @@ class AsyncMemory(MemoryBase):
                 - {"AND": [filter1, filter2]} - logical AND
                 - {"OR": [filter1, filter2]} - logical OR
                 - {"NOT": [filter1]} - logical NOT
-            threshold (float, optional): Minimum score for a memory to be included. Defaults to 0.1.
+            threshold (float, optional): Minimum score for a memory to be included. Defaults to the
+                embedding model profile's semantic_threshold (0.1 for the default profile).
             rerank (bool, optional): Whether to rerank results. Defaults to False.
             explain (bool, optional): Whether to include score_details for each result. Defaults to False.
             reference_date (Any, optional): Platform-only temporal parameter. Not supported in OSS.
@@ -3197,16 +3972,20 @@ class AsyncMemory(MemoryBase):
         )
         search_elapsed_seconds = time.perf_counter() - search_start
 
-        # Apply reranking if enabled and reranker is available
+        # Apply reranking if enabled and reranker is available (top-N scoped,
+        # optional conditional trigger; failure falls back to original results)
         if rerank and self.reranker and original_memories:
-            try:
-                # Run reranking in thread pool to avoid blocking async loop
-                reranked_memories = await asyncio.to_thread(
-                    self.reranker.rerank, query, original_memories, limit
-                )
-                original_memories = reranked_memories
-            except Exception as e:
-                logger.warning(f"Reranking failed, using original results: {e}")
+            candidates = original_memories[: self.config.rerank_top_n]
+            should_rerank = self.config.rerank_trigger != "conditional" or _should_rerank_conditional(
+                self.config, query, candidates
+            )
+            if should_rerank:
+                try:
+                    # Run reranking in thread pool to avoid blocking async loop
+                    reranked_memories = await asyncio.to_thread(self.reranker.rerank, query, candidates, limit)
+                    original_memories = (reranked_memories + original_memories[len(candidates):])[:limit]
+                except Exception as e:
+                    logger.warning(f"Reranking failed, using original results: {e}")
 
         if temporal_usage_notice:
             await display_temporal_usage_notice_async(self, "async", "search", *temporal_usage_notice)
@@ -3329,16 +4108,18 @@ class AsyncMemory(MemoryBase):
                 return True
         return False
 
-    async def _search_vector_store(self, query, filters, limit, threshold=0.1, explain=False, show_expired=False):
+    async def _search_vector_store(self, query, filters, limit, threshold=None, explain=False, show_expired=False):
+        # Resolve the semantic threshold from the model profile when not given explicitly
         if threshold is None:
-            threshold = 0.1
+            threshold = self._model_profile.semantic_threshold
 
         # Step 1: Preprocess query (CPU-bound)
-        query_lemmatized = await asyncio.to_thread(lemmatize_for_bm25, query)
-        query_entities = await asyncio.to_thread(extract_entities, query)
+        query_lemmatized = await asyncio.to_thread(self._text_for_sparse, query)
+        use_dictionary = self.config.entity_source == "llm" or self.config.multilingual
+        query_entities = [] if use_dictionary else await asyncio.to_thread(extract_entities, query)
 
-        # Step 2: Embed query
-        embeddings = await asyncio.to_thread(self.embedding_model.embed, query, "search")
+        # Step 2: Embed query (one forward pass yields dense + sparse when available)
+        embeddings, query_sparse = await asyncio.to_thread(self._embed_text_dual, query, "search")
 
         # Step 3: Semantic search (over-fetch)
         internal_limit = max(limit * 4, 60)
@@ -3347,13 +4128,30 @@ class AsyncMemory(MemoryBase):
         )
 
         # Step 4: Keyword search (if store supports it)
-        keyword_results = await asyncio.to_thread(
-            self.vector_store.keyword_search, query=query_lemmatized, top_k=internal_limit, filters=filters
-        )
+        learned_mode = _learned_sparse_mode(self.vector_store) and query_sparse is not None
+        if learned_mode:
+            keyword_results = await asyncio.to_thread(
+                self.vector_store.keyword_search,
+                query=query, top_k=internal_limit, filters=filters, sparse_vector=query_sparse,
+            )
+        else:
+            keyword_results = await asyncio.to_thread(
+                self.vector_store.keyword_search, query=query_lemmatized, top_k=internal_limit, filters=filters
+            )
 
-        # Step 5: Compute BM25 scores
+        # Step 5: Compute normalized keyword scores
         bm25_scores = {}
-        if keyword_results is not None:
+        if keyword_results is not None and learned_mode:
+            query_self_score = sum(v * v for v in query_sparse["values"])
+            zero_floor = self._model_profile.sparse_zero_floor
+            for mem in keyword_results:
+                mem_id = str(mem.id) if hasattr(mem, 'id') else str(mem.get('id', ''))
+                raw_score = mem.score if hasattr(mem, 'score') else mem.get('score', 0)
+                if raw_score and raw_score > 0:
+                    normalized = normalize_sparse_coverage(raw_score, query_self_score, zero_floor)
+                    if normalized > 0:
+                        bm25_scores[mem_id] = normalized
+        elif keyword_results is not None:
             midpoint, steepness = get_bm25_params(query, lemmatized=query_lemmatized)
             for mem in keyword_results:
                 mem_id = str(mem.id) if hasattr(mem, 'id') else str(mem.get('id', ''))
@@ -3363,7 +4161,9 @@ class AsyncMemory(MemoryBase):
 
         # Step 6: Compute entity boosts
         entity_boosts = {}
-        if query_entities:
+        if use_dictionary:
+            entity_boosts = await self._compute_entity_boosts_multilingual_async(query, filters, embeddings)
+        elif query_entities:
             entity_boosts = await self._compute_entity_boosts_async(query_entities, filters)
 
         # Step 7: Build candidate set from semantic results
@@ -3379,15 +4179,17 @@ class AsyncMemory(MemoryBase):
                 "payload": payload,
             })
 
-        # Step 8: Score and rank
+        # Step 8: Score and rank (fold before top_k truncation when enabled)
         scored_results = score_and_rank(
             semantic_results=candidates,
             bm25_scores=bm25_scores,
             entity_boosts=entity_boosts,
             threshold=threshold,
-            top_k=limit,
+            top_k=len(candidates) if self.config.near_duplicate else limit,
             explain=explain,
         )
+        if self.config.near_duplicate:
+            scored_results = _fold_near_duplicates(scored_results, explain=explain)[:limit]
 
         # Step 9: Format results
         promoted_payload_keys = [
@@ -3506,6 +4308,49 @@ class AsyncMemory(MemoryBase):
 
         return memory_boosts
 
+    async def _entity_vector_matches_async(self, embedding, filters, top_k=500):
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        return await asyncio.to_thread(
+            self.entity_store.search, query="", vectors=embedding, top_k=top_k, filters=search_filters
+        )
+
+    async def _compute_entity_boosts_multilingual_async(self, query, filters, query_embedding):
+        """Async variant of `_compute_entity_boosts_multilingual`."""
+        search_filters = {k: v for k, v in filters.items() if k in ("user_id", "agent_id", "run_id") and v}
+        memory_boosts = {}
+
+        def _apply(linked_memory_ids, similarity):
+            if not isinstance(linked_memory_ids, list):
+                return
+            num_linked = max(len(linked_memory_ids), 1)
+            memory_count_weight = 1.0 / (1.0 + 0.001 * ((num_linked - 1) ** 2))
+            boost = similarity * ENTITY_BOOST_WEIGHT * memory_count_weight
+            for memory_id in linked_memory_ids:
+                if memory_id:
+                    memory_key = str(memory_id)
+                    memory_boosts[memory_key] = max(memory_boosts.get(memory_key, 0.0), boost)
+
+        try:
+            rows = await asyncio.to_thread(self.entity_dictionary.match, query, search_filters)
+            for row in rows:
+                payload = getattr(row, "payload", None) or {}
+                _apply(payload.get("linked_memory_ids", []), 1.0)
+        except Exception as e:
+            logger.warning(f"Entity dictionary match failed (async): {e}")
+
+        try:
+            matches = await self._entity_vector_matches_async(query_embedding, filters)
+            for match in matches:
+                similarity = match.score if hasattr(match, "score") else 0.0
+                if similarity < self._model_profile.entity_vector_threshold:
+                    continue
+                payload = match.payload if hasattr(match, "payload") else {}
+                _apply(payload.get("linked_memory_ids", []), similarity)
+        except Exception as e:
+            logger.warning(f"Entity vector fallback failed (async): {e}")
+
+        return memory_boosts
+
     async def update(
         self,
         memory_id,
@@ -3553,11 +4398,17 @@ class AsyncMemory(MemoryBase):
             update_metadata["expiration_date"] = _normalize_expiration_date(expiration_date)
 
         existing_embeddings = {}
+        existing_sparse = {}
         if text is not None:
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, text, "update")
+            embeddings, sparse = await asyncio.to_thread(self._embed_text_dual, text, "update")
             existing_embeddings[text] = embeddings
+            existing_sparse[text] = sparse
 
-        await self._update_memory(memory_id, text, existing_embeddings, update_metadata)
+        sparse_arg = existing_sparse if any(v is not None for v in existing_sparse.values()) else None
+        if sparse_arg is not None:
+            await self._update_memory(memory_id, text, existing_embeddings, update_metadata, existing_sparse=sparse_arg)
+        else:
+            await self._update_memory(memory_id, text, existing_embeddings, update_metadata)
         await display_first_run_notice_async(self, "async", "update")
         return {"message": "Memory updated successfully!"}
 
@@ -3670,12 +4521,14 @@ class AsyncMemory(MemoryBase):
         await display_first_run_notice_async(self, "async", "history")
         return history
 
-    async def _create_memory(self, data, existing_embeddings, metadata=None):
+    async def _create_memory(self, data, existing_embeddings, metadata=None, existing_sparse=None):
         logger.debug(f"Creating memory with {data=}")
+        self._guard_write()
+        sparse_vector = (existing_sparse or {}).get(data)
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, data, memory_action="add")
+            embeddings, sparse_vector = await asyncio.to_thread(self._embed_text_dual, data, "add")
 
         memory_id = str(uuid.uuid4())
         new_metadata = deepcopy(metadata) if metadata is not None else {}
@@ -3684,13 +4537,21 @@ class AsyncMemory(MemoryBase):
         if "created_at" not in new_metadata:
             new_metadata["created_at"] = datetime.now(timezone.utc).isoformat()
         new_metadata["updated_at"] = new_metadata["created_at"]
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = self._text_for_sparse(data)
+        new_metadata.update(self._version_stamps)
+        new_metadata.update(await self._near_duplicate_tag_async(embeddings, new_metadata))
 
+        insert_kwargs = (
+            {"sparse_vectors": [sparse_vector]}
+            if sparse_vector is not None and _sparse_capable(self.vector_store)
+            else {}
+        )
         await asyncio.to_thread(
             self.vector_store.insert,
             vectors=[embeddings],
             ids=[memory_id],
             payloads=[new_metadata],
+            **insert_kwargs,
         )
 
         await asyncio.to_thread(
@@ -3769,8 +4630,9 @@ class AsyncMemory(MemoryBase):
 
         return result
 
-    async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
+    async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None, existing_sparse=None):
         logger.info(f"Updating memory with {data=}")
+        self._guard_write()
 
         try:
             existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=memory_id)
@@ -3795,20 +4657,28 @@ class AsyncMemory(MemoryBase):
 
         new_metadata["data"] = data
         new_metadata["hash"] = hashlib.md5(data.encode()).hexdigest()
-        new_metadata["text_lemmatized"] = lemmatize_for_bm25(data)
+        new_metadata["text_lemmatized"] = self._text_for_sparse(data)
+        new_metadata.update(self._version_stamps)
         new_metadata["created_at"] = existing_memory.payload.get("created_at")
         new_metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
+            sparse_vector = (existing_sparse or {}).get(data)
         else:
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
+            embeddings, sparse_vector = await asyncio.to_thread(self._embed_text_dual, data, "update")
 
+        update_kwargs = (
+            {"sparse_vector": sparse_vector}
+            if sparse_vector is not None and _sparse_capable(self.vector_store)
+            else {}
+        )
         updated = await asyncio.to_thread(
             self.vector_store.update,
             vector_id=memory_id,
             vector=embeddings,
             payload=new_metadata,
+            **update_kwargs,
         )
         if updated is False:
             raise ValueError(f"Memory with id {memory_id} not found. Please provide a valid 'memory_id'")
@@ -3830,8 +4700,8 @@ class AsyncMemory(MemoryBase):
         # then re-extract entities from the new text and link them back.
         session_filters = {k: new_metadata[k] for k in ("user_id", "agent_id", "run_id") if new_metadata.get(k)}
         if text_changed:
-            await self._remove_memory_from_entity_store(memory_id, session_filters)
-            await self._link_entities_for_memory(memory_id, data, session_filters)
+            await self._remove_memory_from_entity_store(memory_id, session_filters, delete_empty=False)
+            await self._link_entities_for_memory(memory_id, data, session_filters, embedding=embeddings)
 
         return memory_id
 

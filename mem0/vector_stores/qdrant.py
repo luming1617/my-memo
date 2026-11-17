@@ -48,6 +48,7 @@ class Qdrant(VectorStoreBase):
         api_key: str = None,
         https: bool | None = None,
         on_disk: bool = False,
+        sparse_encoder: str = "bm25",
     ):
         """
         Initialize the Qdrant vector store.
@@ -92,11 +93,14 @@ class Qdrant(VectorStoreBase):
         self.collection_name = collection_name
         self.embedding_model_dims = embedding_model_dims
         self.on_disk = on_disk
+        self._sparse_encoder = sparse_encoder
         self._bm25_encoder = None
         # Whether this collection has the `bm25` named sparse vector slot.
         # Pre-v3 collections lack it; writing a `bm25` sparse vector into such a
         # collection is rejected by Qdrant ("Not existing vector name error: bm25").
         self._has_bm25_slot = False
+        # Learned-sparse slot (no IDF modifier: weights are already learned).
+        self._has_lexical_slot = False
         # Local mode is not thread-safe, so update and delete share a lock per client and cannot interleave,
         # including across stores that share one client.
         self._local = isinstance(getattr(self.client, "_client", None), QdrantLocal)
@@ -106,6 +110,11 @@ class Qdrant(VectorStoreBase):
         else:
             self._write_lock = nullcontext()
         self.create_col(embedding_model_dims, on_disk)
+        self.supports_sparse_vectors = self._has_bm25_slot or self._has_lexical_slot
+
+    @property
+    def sparse_encoder(self) -> str:
+        return self._sparse_encoder
 
     def _get_bm25_encoder(self):
         """Lazy-load the BM25 sparse text encoder (fastembed)."""
@@ -158,26 +167,43 @@ class Qdrant(VectorStoreBase):
                 logger.debug(f"Collection {self.collection_name} already exists. Skipping creation.")
                 info = self.client.get_collection(self.collection_name)
                 sparse_cfg = info.config.params.sparse_vectors
-                self._has_bm25_slot = bool(sparse_cfg and "bm25" in sparse_cfg)
-                if not self._has_bm25_slot:
-                    logger.warning(
-                        f"Collection '{self.collection_name}' predates v3 hybrid search (no 'bm25' sparse slot). "
-                        "BM25 keyword scoring will be disabled for this collection; semantic search works normally. "
-                        "To enable hybrid search, use a fresh collection."
-                    )
+                if self._sparse_encoder == "none":
+                    self._has_bm25_slot = False
+                elif self._sparse_encoder == "learned":
+                    self._has_bm25_slot = False
+                    self._has_lexical_slot = bool(sparse_cfg and "lexical" in sparse_cfg)
+                    if not self._has_lexical_slot:
+                        logger.warning(
+                            f"Collection '{self.collection_name}' has no 'lexical' sparse slot. "
+                            "Learned-sparse keyword scoring will be disabled for this collection; "
+                            "semantic search works normally. To enable it, use a fresh collection."
+                        )
+                else:
+                    self._has_bm25_slot = bool(sparse_cfg and "bm25" in sparse_cfg)
+                    if not self._has_bm25_slot:
+                        logger.warning(
+                            f"Collection '{self.collection_name}' predates v3 hybrid search (no 'bm25' sparse slot). "
+                            "BM25 keyword scoring will be disabled for this collection; semantic search works normally. "
+                            "To enable hybrid search, use a fresh collection."
+                        )
                 self._create_filter_indexes()
                 return
 
+        if self._sparse_encoder == "learned":
+            # No modifier: learned weights are already trained; adding IDF
+            # would double-weight them (contrast with the bm25 slot below).
+            sparse_vectors_config = {"lexical": SparseVectorParams()}
+        elif self._sparse_encoder != "none":
+            sparse_vectors_config = {"bm25": SparseVectorParams(modifier=models.Modifier.IDF)}
+        else:
+            sparse_vectors_config = None
         self.client.create_collection(
             collection_name=self.collection_name,
             vectors_config=VectorParams(size=vector_size, distance=distance, on_disk=on_disk),
-            sparse_vectors_config={
-                "bm25": SparseVectorParams(
-                    modifier=models.Modifier.IDF,
-                ),
-            },
+            sparse_vectors_config=sparse_vectors_config,
         )
-        self._has_bm25_slot = True
+        self._has_bm25_slot = self._sparse_encoder == "bm25"
+        self._has_lexical_slot = self._sparse_encoder == "learned"
         self._create_filter_indexes()
 
     def _create_filter_indexes(self):
@@ -200,7 +226,7 @@ class Qdrant(VectorStoreBase):
             except Exception as e:
                 logger.debug(f"Index for {field} might already exist: {e}")
 
-    def insert(self, vectors: list, payloads: list = None, ids: list = None):
+    def insert(self, vectors: list, payloads: list = None, ids: list = None, sparse_vectors: list = None):
         """
         Insert vectors into a collection, including BM25 sparse vectors
         computed from the text_lemmatized payload field.
@@ -209,6 +235,9 @@ class Qdrant(VectorStoreBase):
             vectors (list): List of vectors to insert.
             payloads (list, optional): List of payloads corresponding to vectors. Defaults to None.
             ids (list, optional): List of IDs corresponding to vectors. Defaults to None.
+            sparse_vectors (list, optional): Learned sparse vectors as
+                {"indices": [...], "values": [...]} dicts (entries may be None),
+                written to the `lexical` slot when sparse_encoder="learned".
         """
         logger.info(f"Inserting {len(vectors)} vectors into collection {self.collection_name}")
 
@@ -257,6 +286,9 @@ class Qdrant(VectorStoreBase):
             named_vectors = {"": vector}
             if self._has_bm25_slot and bm25_sparse_vectors[idx] is not None:
                 named_vectors["bm25"] = bm25_sparse_vectors[idx]
+            if self._has_lexical_slot and sparse_vectors and sparse_vectors[idx] is not None:
+                sv = sparse_vectors[idx]
+                named_vectors["lexical"] = SparseVector(indices=sv["indices"], values=sv["values"])
 
             points.append(PointStruct(id=point_id, vector=named_vectors, payload=payload))
 
@@ -468,7 +500,7 @@ class Qdrant(VectorStoreBase):
             logger.warning(f"Batch search failed, falling back to sequential: {e}")
             return [self.search(q, v, top_k=top_k, filters=filters) for q, v in zip(queries, vectors_list)]
 
-    def keyword_search(self, query, top_k=5, filters=None):
+    def keyword_search(self, query, top_k=5, filters=None, sparse_vector=None):
         """
         Search using BM25 sparse vectors for keyword-based retrieval.
 
@@ -476,14 +508,23 @@ class Qdrant(VectorStoreBase):
             query (str): The search query text.
             top_k (int, optional): Number of results to return. Defaults to 5.
             filters (dict, optional): Filters to apply to the search. Defaults to None.
+            sparse_vector (dict, optional): Precomputed learned query sparse
+                vector ({"indices", "values"}) used when sparse_encoder="learned".
 
         Returns:
             list: Search results, or None if BM25 is not available.
         """
-        if not self._has_bm25_slot:
-            return None
-        sparse_query = self._encode_bm25(query)
-        if sparse_query is None:
+        if self._has_lexical_slot:
+            if sparse_vector is None:
+                return None
+            sparse_query = SparseVector(indices=sparse_vector["indices"], values=sparse_vector["values"])
+            slot = "lexical"
+        elif self._has_bm25_slot:
+            sparse_query = self._encode_bm25(query)
+            if sparse_query is None:
+                return None
+            slot = "bm25"
+        else:
             return None
 
         try:
@@ -491,7 +532,7 @@ class Qdrant(VectorStoreBase):
             hits = self.client.query_points(
                 collection_name=self.collection_name,
                 query=sparse_query,
-                using="bm25",
+                using=slot,
                 query_filter=query_filter,
                 limit=top_k,
             )
@@ -515,7 +556,7 @@ class Qdrant(VectorStoreBase):
                 ),
             )
 
-    def update(self, vector_id: int, vector: list = None, payload: dict = None) -> Optional[bool]:
+    def update(self, vector_id: int, vector: list = None, payload: dict = None, sparse_vector: dict = None) -> Optional[bool]:
         """
         Update an existing vector and/or its payload. Never creates a point.
 
@@ -523,6 +564,8 @@ class Qdrant(VectorStoreBase):
             vector_id (int): ID of the vector to update.
             vector (list, optional): Updated vector. Defaults to None.
             payload (dict, optional): Updated payload. Defaults to None.
+            sparse_vector (dict, optional): Learned sparse vector refreshed
+                alongside a full update when sparse_encoder="learned".
 
         Returns:
             Optional[bool]: False if the point does not exist, True if it was updated, None if nothing was given.
@@ -537,6 +580,10 @@ class Qdrant(VectorStoreBase):
                     sparse = self._encode_bm25(text_for_bm25)
                     if sparse is not None:
                         named_vectors["bm25"] = sparse
+            if self._has_lexical_slot and sparse_vector is not None:
+                named_vectors["lexical"] = SparseVector(
+                    indices=sparse_vector["indices"], values=sparse_vector["values"]
+                )
             point = PointStruct(id=vector_id, vector=named_vectors, payload=payload)
             # One write keeps the vector and payload of concurrent updates together. update_only
             # (Qdrant 1.17+) never creates a point; older servers and clients upsert as before.

@@ -1,0 +1,132 @@
+---
+title: "Multilingual Support"
+description: "Store memories in the input language and retrieve them across Chinese, English, and mixed queries with dual dense+sparse vectors, LLM entities, and lossless near-duplicate folding."
+icon: "language"
+---
+
+Mem0 OSS can extract memories in the same language as the conversation and retrieve them reliably across languages. The feature is built from independent, config-gated axes — every axis defaults to the legacy behavior, so existing deployments are unchanged until you opt in.
+
+<Note>
+Multilingual retrieval quality depends on a multilingual embedding model. The default OpenAI embedder keeps working, but cross-language recall is best with a dual-output model (dense + learned sparse in one forward pass, e.g. BGE-M3) served over HTTP.
+</Note>
+
+## Configuration axes
+
+| Config | Controls | Default |
+|--------|----------|---------|
+| `multilingual` | Extraction prompt records memories in the input language; `lang` is stored in payload | `False` |
+| `entity_source` | `"spacy"` (legacy NER) or `"llm"` (extraction-output entities with aliases) | `"spacy"` |
+| `near_duplicate` | Lossless near-duplicate tagging on write + cluster folding on read | `False` |
+| `vector_store.config.sparse_encoder` | `"bm25"` (legacy), `"learned"` (explicit dual-output sparse vectors), `"none"` | `"bm25"` |
+| `embedder.provider` + `profiles` | Embedding engine and per-model retrieval thresholds | `openai` + built-in profile |
+
+Target configuration for Chinese/English deployments:
+
+```python
+from mem0 import Memory
+
+config = {
+    "multilingual": True,
+    "entity_source": "llm",
+    "near_duplicate": True,
+    "embedder": {
+        "provider": "dual_output",
+        "config": {
+            "model": "BAAI/bge-m3",
+            "embedding_dims": 1024,
+            "service_url": "http://your-embedding-service:8080",  # remote batch service
+            # "api_key": "...", "revision": "pinned-weight-revision",
+        },
+    },
+    "vector_store": {
+        "provider": "qdrant",  # or "pgvector" (pgvector >= 0.7.0)
+        "config": {
+            "collection_name": "mem0_ml",  # use a NEW collection
+            "embedding_model_dims": 1024,
+            "sparse_encoder": "learned",
+            "path": "/data/qdrant",
+        },
+    },
+    "llm": {
+        "provider": "openai",
+        "config": {"model": "your-multilingual-model", "openai_base_url": "https://your-gateway/v1"},
+    },
+    # Optional: per-model threshold overrides (measured values ship as defaults)
+    "profiles": {"BAAI/bge-m3": {"semantic_threshold": 0.2}},
+}
+m = Memory.from_config(config)
+```
+
+The `dual_output` embedder talks to a batch HTTP service implementing this contract:
+
+```
+POST {service_url}/embed
+request:  {"texts": ["...", ...]}
+response: {"dense": [[float, ...]], "sparse": [{"indices": [int], "values": [float]}],
+           "model_id": "...", "revision": "..."}
+```
+
+For development without a service, install the optional in-process fallback (`pip install "mem0ai[dual]"`) and omit `service_url`; weights then load locally via FlagEmbedding. Pin weights by revision and load from local paths — do not fetch weights from the public internet at runtime.
+
+## What changes when enabled
+
+### Language-faithful extraction (`multilingual`)
+
+The extraction prompt gains a language requirement: memories are written in the input language and script, and each memory payload carries `lang` (BCP-47 short code). With the flag off, the prompt is byte-identical to previous releases.
+
+### LLM entities with aliases (`entity_source="llm"`)
+
+Extraction also outputs `entities` (surface + aliases + type) and `keywords`, stored in the memory payload as the single source of truth. The entity index is a derived view:
+
+- cross-language names merge by exact alias match (e.g. `苹果公司` ↔ `Apple`), not cosine guessing;
+- the entity collection has no sparse slot;
+- `linked_memory_ids` from extraction (preference updates, contradictions) are now persisted.
+
+Rebuild the derived index from payloads at any time — zero LLM calls:
+
+```python
+m.rebuild_entity_index(filters={"user_id": "u1"})
+# {"rebuilt_memories": 42, "entity_links": 57}
+```
+
+On `update()`, entity links are re-established by alias dictionary plus a whole-text vector fallback, so updating a Chinese memory no longer drops its entity links.
+
+### Learned-sparse keyword path (`sparse_encoder="learned"`)
+
+With a dual-output embedder, one forward pass produces dense and learned-sparse vectors. The sparse vector is written explicitly (Qdrant `lexical` slot without IDF modifier; pgvector `sparsevec` column with an inner-product HNSW index) and queried with coverage normalization plus a zero-signal floor — Chinese exact terms (model numbers, product codes) now hit the keyword path. The legacy `bm25` path is unchanged.
+
+Adapter-level optional parameters (backward compatible):
+
+```python
+store.insert(vectors, payloads, ids, sparse_vectors=[{"indices": [...], "values": [...]}])
+store.keyword_search(query, top_k, filters, sparse_vector={"indices": [...], "values": [...]})
+store.update(vector_id, vector, payload, sparse_vector={...})
+```
+
+Stores without sparse capability simply omit the keyword path; the fusion denominator adapts.
+
+### Lossless near-duplicates (`near_duplicate`)
+
+Every write checks the scoped store's top-1 ANN against the model profile's `near_duplicate_threshold`. Hits are **tagged, never skipped** (`near_duplicate_of` + similarity in payload) — negations and number changes are preserved. At read time, clusters fold to the newest `updated_at` representative with the cluster's best score, before `top_k` truncation; `explain=True` includes cluster details. Turn the flag off to disable tagging and folding.
+
+### Version stamps and write guard
+
+Payloads carry `embedder_id`, `sparse_encoder_id`, and `schema_version`. At startup Mem0 samples existing payloads; a mismatch blocks writes (reads still work) and asks you to use a new collection. Switching embedding models therefore requires a new collection and re-embedding — thresholds are per-model (`profiles`), never reused across models.
+
+### Reranker policy
+
+`rerank=True` remains explicit. New options:
+
+| Config | Default | Effect |
+|--------|---------|--------|
+| `rerank_top_n` | `20` | Only the top N candidates are sent to the reranker |
+| `rerank_trigger` | `"always"` | `"conditional"` reranks only on query/candidate language mismatch or low semantic scores |
+| `rerank_semantic_threshold` | `None` | With `"conditional"`, trigger when the best semantic score is below this value |
+
+Reranker failures fall back to the original results.
+
+## Non-goals
+
+- No change to the ADD-only decision pipeline; UPDATE/DELETE remain explicit API operations.
+- No migration of existing collections — point the new configuration at a fresh collection.
+- `search(threshold=...)` now defaults to the model profile's `semantic_threshold` (0.1 for the default profile, identical to the previous constant).

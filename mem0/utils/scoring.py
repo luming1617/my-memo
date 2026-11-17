@@ -57,6 +57,23 @@ def normalize_bm25(raw_score: float, midpoint: float, steepness: float) -> float
 ENTITY_BOOST_WEIGHT = 0.5
 
 
+def normalize_sparse_coverage(raw_score: float, query_self_score: float, zero_floor: float) -> float:
+    """Coverage normalization for learned-sparse scores (design doc 4.2).
+
+    Divides the raw inner-product score by the query sparse vector's self
+    score (sum of squared query weights): absolute, bounded in [0, 1],
+    calibration-free, and independent of query length. Coverages below
+    ``zero_floor`` are zeroed so cross-language empty/weak signals do not
+    earn score. The legacy BM25 sigmoid path above is untouched.
+    """
+    if query_self_score <= 0:
+        return 0.0
+    coverage = min(raw_score / query_self_score, 1.0)
+    if coverage < zero_floor:
+        return 0.0
+    return coverage
+
+
 def score_and_rank(
     semantic_results: List[Dict[str, Any]],
     bm25_scores: Dict[str, float],

@@ -40,6 +40,9 @@ class BaseEmbedderConfig(ABC):
         aws_secret_access_key: Optional[str] = None,
         aws_session_token: Optional[str] = None,
         aws_region: Optional[str] = None,
+        # Dual-output embedding service specific
+        service_url: Optional[str] = None,
+        revision: Optional[str] = None,
     ):
         """
         Initializes a configuration class instance for the Embeddings.
@@ -109,3 +112,7 @@ class BaseEmbedderConfig(ABC):
         self.aws_secret_access_key = aws_secret_access_key
         self.aws_session_token = aws_session_token
         self.aws_region = aws_region or os.environ.get("AWS_REGION") or "us-west-2"
+
+        # Dual-output embedding service specific
+        self.service_url = service_url
+        self.revision = revision

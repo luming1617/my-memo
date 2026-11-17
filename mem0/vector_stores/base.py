@@ -2,14 +2,25 @@ from abc import ABC, abstractmethod
 
 
 class VectorStoreBase(ABC):
+    # Adapters that natively store and search learned sparse vectors set this
+    # True (per instance, after slot detection). The Memory layer only passes
+    # explicit sparse vectors to stores that declare the capability.
+    supports_sparse_vectors = False
+
     @abstractmethod
     def create_col(self, name, vector_size, distance):
         """Create a new collection."""
         pass
 
     @abstractmethod
-    def insert(self, vectors, payloads=None, ids=None):
-        """Insert vectors into a collection."""
+    def insert(self, vectors, payloads=None, ids=None, sparse_vectors=None):
+        """Insert vectors into a collection.
+
+        sparse_vectors: optional list of {"indices": [int], "values": [float]}
+        dicts (one per vector, entries may be None). Only accepted by adapters
+        with supports_sparse_vectors=True; other adapters keep the legacy
+        three-argument signature.
+        """
         pass
 
     @abstractmethod
@@ -31,11 +42,14 @@ class VectorStoreBase(ABC):
         pass
 
     @abstractmethod
-    def update(self, vector_id, vector=None, payload=None):
+    def update(self, vector_id, vector=None, payload=None, sparse_vector=None):
         """Update an existing vector and/or its payload without ever creating a record.
 
         Return False if no record with vector_id exists, True if it was updated. None means the store
         cannot tell, and callers treat it as updated.
+
+        sparse_vector: optional {"indices": [int], "values": [float]} dict refreshed
+        alongside a full (vector+payload) update by sparse-capable adapters.
         """
         pass
 
@@ -69,7 +83,7 @@ class VectorStoreBase(ABC):
         """Reset by delete the collection and recreate it."""
         pass
 
-    def keyword_search(self, query: str, top_k: int = 5, filters: dict = None):
+    def keyword_search(self, query: str, top_k: int = 5, filters: dict = None, sparse_vector: dict = None):
         """Keyword/BM25 full-text search. Returns None if not supported by this store.
 
         Override in subclasses that support native keyword/BM25 search.
@@ -80,6 +94,9 @@ class VectorStoreBase(ABC):
             query: The search query text (should be lemmatized for best results).
             top_k: Maximum number of results to return.
             filters: Optional metadata filters (same format as search filters).
+            sparse_vector: Optional precomputed query sparse vector
+                ({"indices": [int], "values": [float]}) for learned-sparse
+                adapters; legacy BM25 adapters encode the query text instead.
 
         Returns:
             List of search results with id, score, payload, or None if not supported.

@@ -1,0 +1,283 @@
+{
+  "version": 1,
+  "description": "Mem0 multilingual evaluation dataset. Case classes map to design doc chapters 3-5 and stage acceptance (chapter 8). 'extraction' blocks are canned LLM outputs consumed by the deterministic mock LLM; with a real LLM they are ignored. 'facts' entries are alternative-substring groups: a fact counts as covered when any alternative appears in any stored memory text.",
+  "cases": [
+    {
+      "id": "zh_ext_01",
+      "class": "zh_extraction",
+      "scope": {"user_id": "eval_zh_ext_01"},
+      "expect": {"lang": "zh", "facts": [["手冲咖啡"], ["耶加雪菲"], ["香山"], ["徒步"]]},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "我叫张伟，平时最喜欢喝手冲咖啡，尤其是耶加雪菲。周末经常去北京香山徒步。"}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "张伟最喜欢喝手冲咖啡，尤其是耶加雪菲产区的咖啡豆", "attributed_to": "user"},
+            {"id": "1", "text": "张伟周末经常去北京香山徒步", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "用户喜欢什么咖啡", "expect_markers": ["咖啡"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "zh_ext_02",
+      "class": "zh_extraction",
+      "scope": {"user_id": "eval_zh_ext_02"},
+      "expect": {"lang": "zh", "facts": [["iPhone 16 Pro"], ["256G"], ["8999"], ["苹果官网"]]},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "我上个月买了一台 iPhone 16 Pro 256G，花了 8999 元，是在苹果官网买的。"}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "用户上个月在苹果官网购买了一台 iPhone 16 Pro 256G，花费 8999 元", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": []
+    },
+    {
+      "id": "en_ext_01",
+      "class": "en_extraction",
+      "scope": {"user_id": "eval_en_ext_01"},
+      "expect": {"lang": "en", "facts": [["pour-over"], ["Blue Ridge"], ["hike"]]},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "My name is Sarah and I love pour-over coffee. I hike in the Blue Ridge Mountains every weekend."}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "Sarah loves pour-over coffee", "attributed_to": "user"},
+            {"id": "1", "text": "Sarah hikes in the Blue Ridge Mountains every weekend", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "what coffee does the user like", "expect_markers": ["coffee"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "en_ext_02",
+      "class": "en_extraction",
+      "scope": {"user_id": "eval_en_ext_02"},
+      "expect": {"lang": "en", "facts": [["iPhone 16 Pro"], ["256G"], ["999"], ["Apple"]]},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "I bought an iPhone 16 Pro 256G last month for $999 from the Apple website."}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "The user bought an iPhone 16 Pro 256G last month for $999 from the Apple website", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": []
+    },
+    {
+      "id": "mixed_ext_01",
+      "class": "mixed_extraction",
+      "scope": {"user_id": "eval_mixed_ext_01"},
+      "expect": {"facts": [["MacBook Pro"], ["Rust"], ["battery"]]},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "我最近在用 MacBook Pro 写 Rust 代码，感觉 battery life 很顶。"}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "用户最近在用 MacBook Pro 写 Rust 代码，认为 battery life 很好", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": []
+    },
+    {
+      "id": "cross_01",
+      "class": "cross_lingual_recall",
+      "scope": {"user_id": "eval_cross_01"},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "我最喜欢喝手冲咖啡，尤其是耶加雪菲。"}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "用户最喜欢喝手冲咖啡，尤其是耶加雪菲产区的咖啡豆", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "What kind of coffee does the user like?", "expect_markers": ["咖啡"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "cross_02",
+      "class": "cross_lingual_recall",
+      "scope": {"user_id": "eval_cross_02"},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "I love pour-over coffee, especially Yirgacheffe beans."}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "The user loves pour-over coffee, especially Yirgacheffe beans", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "用户喜欢什么咖啡？", "expect_markers": ["coffee"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "lexical_01",
+      "class": "lexical_precision_zh",
+      "scope": {"user_id": "eval_lexical_01"},
+      "adds": [
+        {
+          "infer": false,
+          "messages": [
+            {"role": "user", "content": "用户的手机型号是 iPhone 16 Pro 256G，购于苹果官网"}
+          ]
+        }
+      ],
+      "queries": [
+        {"query": "iPhone 16 Pro 256G", "expect_markers": ["iPhone 16 Pro 256G"], "top_k": 3}
+      ]
+    },
+    {
+      "id": "lexical_02",
+      "class": "lexical_precision_zh",
+      "scope": {"user_id": "eval_lexical_02"},
+      "adds": [
+        {
+          "infer": false,
+          "messages": [
+            {"role": "user", "content": "家里路由器型号是 XJ-900，放在书房"}
+          ]
+        }
+      ],
+      "queries": [
+        {"query": "XJ-900", "expect_markers": ["XJ-900"], "top_k": 3}
+      ]
+    },
+    {
+      "id": "entity_01",
+      "class": "entity_boost_zh",
+      "scope": {"user_id": "eval_entity_01"},
+      "adds": [
+        {
+          "messages": [
+            {"role": "user", "content": "我在苹果公司工作，负责 iPhone 产品线。"}
+          ],
+          "extraction": {"memory": [
+            {"id": "0", "text": "用户在苹果公司工作，负责 iPhone 产品线", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "苹果公司", "expect_markers": ["苹果公司"], "expect_entity_boost": true, "top_k": 5}
+      ]
+    },
+    {
+      "id": "entity_02",
+      "class": "entity_alias_guard",
+      "scope": {"user_id": "eval_entity_02"},
+      "adds": [
+        {
+          "infer": false,
+          "messages": [
+            {"role": "user", "content": "The user grows Pineapple plants in the garden"}
+          ]
+        }
+      ],
+      "queries": [
+        {"query": "Apple stock price", "forbid_boost_markers": ["Pineapple"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "nd_01",
+      "class": "near_duplicate_translation",
+      "scope": {"user_id": "eval_nd_01"},
+      "fold_expected": true,
+      "adds": [
+        {
+          "messages": [{"role": "user", "content": "我喜欢喝手冲咖啡。"}],
+          "extraction": {"memory": [
+            {"id": "0", "text": "张伟喜欢喝手冲咖啡", "attributed_to": "user"}
+          ]}
+        },
+        {
+          "messages": [{"role": "user", "content": "I like pour-over coffee."}],
+          "extraction": {"memory": [
+            {"id": "0", "text": "Zhang Wei likes pour-over coffee", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "咖啡", "expect_markers": ["咖啡"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "nd_02",
+      "class": "near_duplicate_negation",
+      "scope": {"user_id": "eval_nd_02"},
+      "fold_expected": false,
+      "adds": [
+        {
+          "messages": [{"role": "user", "content": "我喜欢喝咖啡。"}],
+          "extraction": {"memory": [
+            {"id": "0", "text": "张伟喜欢喝咖啡", "attributed_to": "user"}
+          ]}
+        },
+        {
+          "messages": [{"role": "user", "content": "我戒咖啡了，以后不喝了。"}],
+          "extraction": {"memory": [
+            {"id": "0", "text": "张伟不再喝咖啡了", "attributed_to": "user"}
+          ]}
+        }
+      ],
+      "queries": [
+        {"query": "咖啡", "expect_markers": ["咖啡"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "nd_03",
+      "class": "near_duplicate_number",
+      "scope": {"user_id": "eval_nd_03"},
+      "fold_expected": false,
+      "adds": [
+        {
+          "infer": false,
+          "messages": [{"role": "user", "content": "用户的手机是 iPhone 16 Pro 256G"}]
+        },
+        {
+          "infer": false,
+          "messages": [{"role": "user", "content": "用户的手机是 iPhone 16 Pro 512G"}]
+        }
+      ],
+      "queries": [
+        {"query": "iPhone 16 Pro", "expect_markers": ["iPhone 16 Pro"], "top_k": 5}
+      ]
+    },
+    {
+      "id": "tenant_01",
+      "class": "multi_tenant",
+      "scope": {"user_id": "eval_tenant_01_a"},
+      "adds": [
+        {
+          "infer": false,
+          "messages": [{"role": "user", "content": "用户喜欢喝手冲咖啡"}]
+        },
+        {
+          "infer": false,
+          "scope": {"user_id": "eval_tenant_01_b"},
+          "messages": [{"role": "user", "content": "用户喜欢喝手冲咖啡"}]
+        }
+      ],
+      "queries": [
+        {"query": "咖啡", "expect_markers": ["咖啡"], "top_k": 5, "isolation": true}
+      ]
+    }
+  ]
+}

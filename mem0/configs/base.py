@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -53,6 +53,36 @@ class MemoryConfig(BaseModel):
     )
     custom_instructions: Optional[str] = Field(
         description="Custom instructions for fact extraction",
+        default=None,
+    )
+    multilingual: bool = Field(
+        description="Extract memories in the same language as the input messages (injects the language requirement into the extraction prompt)",
+        default=False,
+    )
+    entity_source: Literal["spacy", "llm"] = Field(
+        description="Entity source for ingestion and update relinking: 'spacy' (legacy NER) or 'llm' (extraction-output entities with aliases)",
+        default="spacy",
+    )
+    near_duplicate: bool = Field(
+        description="Lossless near-duplicate tagging on write (top-1 ANN >= profile threshold) plus read-time cluster folding",
+        default=False,
+    )
+    rerank_top_n: int = Field(
+        description="Maximum number of top candidates passed to the reranker when rerank=True",
+        default=20,
+    )
+    rerank_trigger: Literal["always", "conditional"] = Field(
+        description="'always': rerank whenever rerank=True (legacy semantics, top-N scoped). "
+        "'conditional': rerank only on query/candidate language mismatch or low semantic scores.",
+        default="always",
+    )
+    rerank_semantic_threshold: Optional[float] = Field(
+        description="With rerank_trigger='conditional', trigger reranking when the best candidate's "
+        "semantic score is below this value. None disables the low-score trigger.",
+        default=None,
+    )
+    profiles: Optional[Dict[str, Dict[str, Any]]] = Field(
+        description="Per-model ModelProfile overrides keyed by embedding model id (e.g. {'bge-m3': {'semantic_threshold': 0.2}})",
         default=None,
     )
 

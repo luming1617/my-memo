@@ -965,6 +965,17 @@ The attributed_to field should still reflect the original source: "user" for fac
 PAST_MESSAGE_TRUNCATION_LIMIT = 300
 
 
+RETRIEVAL_METADATA_SECTION = """## Retrieval Metadata
+
+For EACH memory object, also output these fields:
+- "lang" (string, required): BCP-47 short code of the memory text language, e.g. "zh", "en", "ja".
+- "entities" (array, required): named entities central to the memory. Each item is {"surface": "<name as written>", "aliases": ["<alternate names, translations, abbreviations>"], "type": "<person|org|location|brand|work|topic|concept|identifier>"}. Use [] when the memory has no named entities. Cross-language aliases of the same entity (e.g. 苹果公司 / Apple) MUST be listed so they can be merged.
+- "keywords" (array of strings, optional): normalized identifiers or bilingual keywords worth exact matching, e.g. model numbers, product codes ("iPhone 16 Pro 256G").
+
+Example for Chinese input:
+{"memory": [{"id": "0", "text": "张伟在苹果公司工作，负责 iPhone 16 Pro 产品线", "attributed_to": "user", "lang": "zh", "entities": [{"surface": "苹果公司", "aliases": ["Apple", "苹果"], "type": "org"}, {"surface": "iPhone 16 Pro", "aliases": [], "type": "brand"}], "keywords": ["iPhone 16 Pro"]}]}"""
+
+
 def _truncate_content(text, limit=PAST_MESSAGE_TRUNCATION_LIMIT):
     """Truncate text to limit characters, appending '...' when shortened."""
     if len(text) <= limit:
@@ -1024,6 +1035,7 @@ def generate_additive_extraction_prompt(
     timestamp=None,
     custom_instructions=None,
     use_input_language=False,
+    include_metadata=False,
 ):
     """Build the user prompt for additive (ADD-only) extraction with linking.
 
@@ -1057,6 +1069,9 @@ def generate_additive_extraction_prompt(
             "7. For Japanese: explicitly resolve omitted subjects using conversation context.\n"
             "8. For CJK languages: maintain appropriate formality level from the source text."
         )
+
+    if include_metadata:
+        sections.append(RETRIEVAL_METADATA_SECTION)
 
     sections.append("# Output:")
     return "\n\n".join(sections)

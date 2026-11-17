@@ -1,4 +1,4 @@
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,6 +21,10 @@ class QdrantConfig(BaseModel):
         description="Whether to force HTTPS on or off. Explicit schemes in url take precedence.",
     )
     on_disk: Optional[bool] = Field(False,description="Enables persistent storage. Vectors are kept on disk (True) or in memory (False). Does not delete the local database path.")
+    sparse_encoder: Literal["bm25", "learned", "none"] = Field(
+        "bm25",
+        description="Sparse encoding for the keyword path: 'bm25' (legacy fastembed slot), 'learned' (lexical slot, explicit dual-output vectors) or 'none' (no sparse slot, e.g. derived entity index)",
+    )
 
     @model_validator(mode="before")
     @classmethod
